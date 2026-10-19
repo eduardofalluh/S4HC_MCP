@@ -1,0 +1,7 @@
+# Pinned to the versions the 57-test suite was run against (2026-10-19).
+fastmcp==4.1.1
+requests==2.34.2
+python-dotenv==1.2.3
+
+# Test only
+pytest==9.1.1
