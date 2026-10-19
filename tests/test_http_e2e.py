@@ -14,6 +14,8 @@ import sys
 import textwrap
 import time
 
+import secrets
+
 import pytest
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
@@ -71,7 +73,10 @@ def call(url, name, headers=None, **args):
     return asyncio.run(run())
 
 
-TENANT = {"x-s4hc-base-url": "https://tenant-api.s4hana.cloud.sap", "x-s4hc-user": "comm_user", "x-s4hc-password": "secret"}
+# Generated per run — never a committed literal.
+_TENANT_PW = secrets.token_urlsafe(16)
+_API_KEY = secrets.token_urlsafe(24)
+TENANT = {"x-s4hc-base-url": "https://tenant-api.s4hana.cloud.sap", "x-s4hc-user": "comm_user", "x-s4hc-password": _TENANT_PW}
 
 
 def test_lists_all_tools(server_url):
@@ -99,7 +104,7 @@ def test_headers_drive_tenant_and_defaults(server_url):
     assert out["status"] == "ok" and out["auth_mode"] == "header-basic"
     assert out["base_url"] == "https://tenant-api.s4hana.cloud.sap"
     assert out["default_ledger"] == "2L" and out["controlling_area"] == "A000"
-    assert "secret" not in json.dumps(out)
+    assert _TENANT_PW not in json.dumps(out)
 
 
 def test_full_flow_over_http(server_url):
@@ -142,7 +147,7 @@ def keyed_server_url(tmp_path_factory):
     """))
     port = _free_port()
     env = {k: v for k, v in os.environ.items() if not k.startswith("S4HC_")}
-    env.update({"PYTHONPATH": str(shim), "LOG_LEVEL": "WARNING", "S4HC_MCP_API_KEY": "k3y-for-tests"})
+    env.update({"PYTHONPATH": str(shim), "LOG_LEVEL": "WARNING", "S4HC_MCP_API_KEY": _API_KEY})
     proc = subprocess.Popen([sys.executable, "server.py", "--http", "--port", str(port)], cwd=ROOT, env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     deadline = time.time() + 20
@@ -162,7 +167,7 @@ def test_inbound_api_key_enforced(keyed_server_url):
                    headers={"Accept": "application/json, text/event-stream"})
     assert r.status_code == 401
     r = requests.post(keyed_server_url, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
-                   headers={"Accept": "application/json, text/event-stream", "Authorization": "Bearer wrong"})
+                   headers={"Accept": "application/json, text/event-stream", "Authorization": f"Bearer {secrets.token_urlsafe(24)}"})
     assert r.status_code == 401
-    out = call(keyed_server_url, "s4hc_health", headers={**TENANT, "Authorization": "Bearer k3y-for-tests"})
+    out = call(keyed_server_url, "s4hc_health", headers={**TENANT, "Authorization": f"Bearer {_API_KEY}"})
     assert out["auth_mode"] == "header-basic"

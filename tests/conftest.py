@@ -6,9 +6,15 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import secrets as _secrets  # noqa: E402
+
+# Throwaway credentials generated per test run: the fake backend never checks
+# them, and nothing credential-like is committed to the repository.
+TEST_USER = "test_comm_user"
+TEST_PASSWORD = _secrets.token_urlsafe(16)
 os.environ.update({
     "S4HC_BASE_URL": "https://my-api.s4hana.cloud.sap",
-    "S4HC_USER": "u", "S4HC_PASSWORD": "p",
+    "S4HC_USER": TEST_USER, "S4HC_PASSWORD": TEST_PASSWORD,
     "S4HC_PAGE_SIZE": "2",
 })
 
