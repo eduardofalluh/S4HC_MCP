@@ -21,7 +21,9 @@ from __future__ import annotations
 import atexit
 import hashlib
 import os
+import re
 import tempfile
+import threading
 from urllib.parse import urlsplit
 
 from .errors import S4HCError
@@ -147,6 +149,10 @@ GLACCOUNT_DEFAULT_SELECT = [
 ]
 
 DEFAULT_HOST_SUFFIXES = (".s4hana.cloud.sap", ".s4hana.ondemand.com")
+# The whole URL may only use these characters: anything else (backslash, %,
+# whitespace, non-ASCII) can make urlsplit and the HTTP stack disagree on the host.
+_URL_CHARS = re.compile(r"^https://[A-Za-z0-9.\-]+(:[0-9]{1,5})?/?$")
+_DNS_NAME = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
 
 
 def allowed_host_suffixes() -> tuple[str, ...]:
@@ -165,8 +171,16 @@ def get_base_url(override: str | None = None) -> str:
     url = (override or os.getenv("S4HC_BASE_URL") or "").strip().rstrip("/")
     if not url:
         raise S4HCError("S4HC_BASE_URL is not set. Expected https://<tenant>-api.s4hana.cloud.sap", "NOT_CONFIGURED")
+    if not _URL_CHARS.match(url):
+        raise S4HCError("The S/4HANA Cloud API URL must be a plain https://host[:port] origin", "NOT_CONFIGURED")
     parts = urlsplit(url)
     host = (parts.hostname or "").lower()
+    if not _DNS_NAME.match(host):
+        raise S4HCError(f"{host!r} is not a valid DNS host name", "NOT_CONFIGURED")
+    try:
+        port = parts.port
+    except ValueError:
+        raise S4HCError("The S/4HANA Cloud API URL has an invalid port", "NOT_CONFIGURED") from None
     if (parts.scheme != "https" or not host or parts.username or parts.password or parts.query
             or parts.fragment or parts.path not in ("", "/")):
         raise S4HCError("The S/4HANA Cloud API URL must be a plain https:// origin with no path, user or query",
@@ -175,7 +189,7 @@ def get_base_url(override: str | None = None) -> str:
                for s in allowed_host_suffixes()):
         raise S4HCError(f"Host {host!r} is not an allowed S/4HANA Cloud API host "
                         "(set S4HC_ALLOWED_HOST_SUFFIXES to allow it)", "NOT_CONFIGURED")
-    return f"https://{host}" + (f":{parts.port}" if parts.port else "")
+    return f"https://{host}" + (f":{port}" if port else "")
 
 
 def get_language() -> str:
@@ -218,6 +232,7 @@ def person_fields_allowed() -> bool:
 
 _cert_cache: dict[str, str | tuple[str, str] | None] = {}
 _temp_files: list[str] = []
+_cert_lock = threading.Lock()
 
 
 def _cleanup_temp_files() -> None:
@@ -249,23 +264,24 @@ def resolve_client_cert() -> str | tuple[str, str] | None:
     cert_pem = os.getenv("S4HC_CLIENT_CERT_PEM")
     key_pem = os.getenv("S4HC_CLIENT_KEY_PEM")
     ident = hashlib.sha256("\0".join(v or "" for v in (cert_path, key_path, cert_pem, key_pem)).encode()).hexdigest()
-    if ident in _cert_cache:
-        return _cert_cache[ident]
+    with _cert_lock:  # tools run in a thread pool: two first calls must not each write the key
+        if ident in _cert_cache:
+            return _cert_cache[ident]
 
-    if cert_pem:
-        cert_path = _write_private("s4hc_cert_", cert_pem)
-        if key_pem:
-            key_path = _write_private("s4hc_key_", key_pem)
+        if cert_pem:
+            cert_path = _write_private("s4hc_cert_", cert_pem)
+            if key_pem:
+                key_path = _write_private("s4hc_key_", key_pem)
 
-    resolved: str | tuple[str, str] | None
-    if cert_path and key_path:
-        resolved = (cert_path, key_path)
-    elif cert_path:
-        resolved = cert_path
-    else:
-        resolved = None
-    _cert_cache[ident] = resolved
-    return resolved
+        resolved: str | tuple[str, str] | None
+        if cert_path and key_path:
+            resolved = (cert_path, key_path)
+        elif cert_path:
+            resolved = cert_path
+        else:
+            resolved = None
+        _cert_cache[ident] = resolved
+        return resolved
 
 
 # Dimensions usable for actual-vs-plan alignment (present in both entities).

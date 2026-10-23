@@ -113,6 +113,13 @@ def build_filter(
     return flt
 
 
+def allowlist_too_big_for_filter(values: list[str]) -> bool:
+    """An allowlist is applied to the rows instead of the $filter once it would
+    use more than half the filter budget, leaving room for the other conditions."""
+    clause = " or ".join(f"CostCenter eq {odata_str(v)}" for v in values)
+    return len(values) > MAX_VALUES_PER_LIST or len(clause) > MAX_FILTER_CHARS // 2
+
+
 def _reaggregate(rows: list[dict], dims: list[str], amount: str) -> list[dict]:
     acc: dict[tuple, Decimal] = defaultdict(Decimal)
     for r in rows:
@@ -173,7 +180,7 @@ def fetch_actuals(
     # instead: select CostCenter too, drop out-of-scope rows, re-aggregate.
     post_filter: frozenset[str] | None = None
     select_dims = list(dims)
-    if not requested_ccs and lists["cost_centers"] and len(lists["cost_centers"]) > MAX_VALUES_PER_LIST:
+    if not requested_ccs and lists["cost_centers"] and allowlist_too_big_for_filter(lists["cost_centers"]):
         post_filter = get_scope(ctx).cost_centers
         lists["cost_centers"] = None
         if "CostCenter" not in select_dims:

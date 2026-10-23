@@ -30,6 +30,7 @@ _SAFE_ID = re.compile(r"^[A-Za-z0-9_\-./ ]{1,40}$")
 _SAP_DATE = re.compile(r"^/Date\((-?\d+)(?:[+-]\d+)?\)/$")
 RETRY_STATUS = {429, 502, 503, 504}
 MAX_RETRY_WAIT = 30.0
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
 
 def odata_str(value: str) -> str:
@@ -90,6 +91,25 @@ def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def parse_entity_types(xml: str) -> dict[str, str]:
+    """EntityType name -> its XML body, in one linear pass (a lazy regex over an
+    unclosed tag is quadratic)."""
+    out: dict[str, str] = {}
+    pos = 0
+    while True:
+        start = xml.find("<EntityType ", pos)
+        if start < 0:
+            return out
+        end = xml.find("</EntityType>", start)
+        if end < 0:
+            return out
+        head_end = xml.find(">", start, end)
+        m = re.match(r'<EntityType Name="([^"]+)"', xml[start:head_end + 1])
+        if m:
+            out[m.group(1)] = xml[head_end + 1:end]
+        pos = end + len("</EntityType>")
+
+
 def _retry_after(value: str | None, attempt: int) -> float:
     """Seconds to wait before a retry: Retry-After as seconds or an HTTP-date,
     else exponential backoff. Never negative, never above MAX_RETRY_WAIT."""
@@ -132,6 +152,7 @@ class S4HCClient:
                 "No credentials: set S4HC_USER + S4HC_PASSWORD or S4HC_CLIENT_CERT(_PEM)", "NOT_CONFIGURED"
             )
         self.session.headers.update({"Accept": "application/json"})
+        self.verified = False  # set once SAP has accepted these credentials
 
     # ------------------------------------------------------------------ http
     def _request(self, url: str, params: dict[str, Any] | None = None, accept: str = "application/json",
@@ -164,7 +185,14 @@ class S4HCClient:
         raise S4HCError(f"S/4HANA Cloud did not answer within {config.get_request_deadline():.0f}s", "SAP_UNAVAILABLE")
 
     def _raise_for_status(self, r: requests.Response, url: str) -> None:
+        try:
+            size = int(r.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if size > MAX_RESPONSE_BYTES:
+            raise S4HCError(f"Response of {size} bytes exceeds the {MAX_RESPONSE_BYTES} byte limit", "QUERY_TOO_LARGE")
         if r.status_code < 300:
+            self.verified = True
             return
         path = url.replace(self.base_url, "").split("?")[0]
         if r.status_code < 400:

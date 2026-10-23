@@ -165,10 +165,13 @@ def test_rate_limit_is_per_connection(monkeypatch):
             return "ok"
         return asyncio.run(mw.on_call_tool(MC(), ok))
 
-    assert call(header_ctx("pw-a")) == "ok"
+    a, b = header_ctx("pw-a", user="tenant_a"), header_ctx("pw-b", user="tenant_b")
+    for ctx in (a, b):  # both connections have been accepted by SAP
+        dependencies.get_client(ctx).verified = True
+    assert call(a) == "ok"
     with pytest.raises(S4HCError, match="Rate limit"):
-        call(header_ctx("pw-a"))
-    assert call(header_ctx("pw-b")) == "ok"  # another tenant/credential is not locked out
+        call(a)
+    assert call(b) == "ok"  # another tenant is not locked out
 
 
 # --------------------------------------------------- financial correctness
@@ -363,3 +366,164 @@ def test_retry_after_http_date_is_retried(tool, calls):
 def test_amounts_stay_decimal(tool):
     out = tool("cost_center_summary")(ctx=None, fiscal_year=2026, cost_centers=["CC100"])
     assert Decimal(out["grand_total"]) == Decimal("15370.50")
+
+
+# ------------------------------------------------------------ round 2
+def test_long_ids_switch_allowlist_to_row_filter_before_hitting_url_limit(tool, calls, monkeypatch):
+    long_ids = [f"Y{i:09d}" for i in range(150)]  # under 200 values, over half the filter budget
+    monkeypatch.setenv("S4HC_ALLOWED_COST_CENTERS", ",".join(["CC300"] + long_ids))
+    out = tool("cost_center_summary")(ctx=None, fiscal_year=2026)
+    assert [c["cost_center"] for c in out["cost_centers"]] == ["CC300"]
+    assert "CostCenter eq 'Y" not in calls[-1]["params"]["$filter"]
+
+
+def test_list_cost_centers_scopes_before_top_with_large_allowlist(tool, monkeypatch):
+    monkeypatch.setenv("S4HC_ALLOWED_COST_CENTERS", ",".join(["CC300"] + [f"X{i:04d}" for i in range(250)]))
+    out = tool("list_cost_centers")(ctx=None, top=1)  # CC100 and CC200 sort first but are out of scope
+    assert [c["CostCenter"] for c in out["cost_centers"]] == ["CC300"]
+
+
+def test_truncated_profit_center_assignment_is_reported(tool, monkeypatch):
+    monkeypatch.setenv("S4HC_MAX_ROWS", "2")  # 3 assignment rows: the read is cut
+    out = tool("list_profit_centers")(ctx=None, company_code="1710")
+    assert out["truncated"] is True and any("assignment" in w for w in out["completeness"]["warnings"])
+
+
+def test_bad_port_is_not_configured():
+    with pytest.raises(S4HCError, match="NOT_CONFIGURED"):
+        config.get_base_url("https://tenant-api.s4hana.cloud.sap:99999")
+
+
+def test_health_has_an_overall_budget(tool, monkeypatch):
+    from src.s4hc.tools import health
+    monkeypatch.setattr(health, "HEALTH_BUDGET_SECONDS", -1)
+    out = tool("s4hc_health")(ctx=None, live=True)
+    assert out["status"] == "error" and all("budget" in c["error"] for c in out["services"].values())
+
+
+def test_inline_row_ceiling_caps_raw_tools(tool, monkeypatch):
+    monkeypatch.setenv("S4HC_MAX_INLINE_ROWS", "3")
+    out = tool("get_cost_center_actuals")(ctx=None, fiscal_year=2026, top=5000)
+    assert out["count"] == 3 and out["truncated"] is True and out["completeness"]["status"] == "partial"
+    csv_out = tool("export_actuals_csv")(ctx=None, fiscal_year=2026, top=5000)
+    assert csv_out["row_count"] == 3 and csv_out["truncated"] is True
+
+
+def test_rate_limit_buckets_are_bounded(monkeypatch):
+    import asyncio
+
+    from src.s4hc.governance import AuditAndRateLimitMiddleware
+    mw = AuditAndRateLimitMiddleware()
+    monkeypatch.setattr(mw, "MAX_BUCKETS", 4)
+
+    class Msg:
+        name, arguments = "fiscal_context", {}
+
+    async def ok(_):
+        return "ok"
+
+    for i in range(10):
+        class MC:
+            message = Msg()
+            fastmcp_context = header_ctx("pw", user=f"user_{i}")
+        asyncio.run(mw.on_call_tool(MC(), ok))
+    assert len(mw._buckets) == 4
+
+
+def test_profit_centers_cap_after_company_filter(tool):
+    out = tool("list_profit_centers")(ctx=None, company_code="1010", top=1)
+    assert [p["ProfitCenter"] for p in out["profit_centers"]] == ["PC1"] and out["truncated"] is True
+
+
+@pytest.mark.parametrize("url", ["https://attacker.example\\.s4hana.cloud.sap", "https://attacker.example%5C.s4hana.cloud.sap",
+                                 "https://attacker.example .s4hana.cloud.sap", "https://tenant-api.s4hana.cloud.sap\\@evil.com",
+                                 "https://tenänt-api.s4hana.cloud.sap", "https://-bad.s4hana.cloud.sap"])
+def test_host_parsers_cannot_disagree(url):
+    with pytest.raises(S4HCError, match="NOT_CONFIGURED"):
+        config.get_base_url(url)
+
+
+def test_blank_allowlist_header_is_refused_not_unrestricted(tool):
+    with pytest.raises(S4HCError, match="UNAUTHORIZED_SCOPE"):
+        tool("list_company_codes")(ctx=Ctx({"x-s4hc-allowed-company-codes": "  "}))
+
+
+def test_empty_bind_host_is_public():
+    import server
+    assert not server._is_loopback("") and not server._is_loopback("0.0.0.0") and not server._is_loopback("::")
+    assert server._is_loopback("127.0.0.1") and server._is_loopback("::1") and server._is_loopback("localhost")
+
+
+def test_raw_read_never_returns_person_fields(tool, monkeypatch):
+    monkeypatch.setenv("S4HC_ENABLE_RAW_ODATA", "true")
+    out = tool("s4hc_odata_read")(ctx=None, service="API_COSTCENTER_SRV", entity_set="A_CostCenter")
+    assert out["rows"] and all("CostCtrResponsiblePersonName" not in r for r in out["rows"])
+    with pytest.raises(S4HCError, match="S4HC_EXPOSE_PERSON_FIELDS"):
+        tool("s4hc_odata_read")(ctx=None, service="API_COSTCENTER_SRV", entity_set="A_CostCenter",
+                                params={"$filter": "CostCtrResponsiblePersonName eq 'x'"})
+
+
+def test_fingerprint_is_keyed_not_plain_sha256():
+    import hashlib
+    conn = dependencies.resolve_connection(header_ctx("pw-one"))
+    plain = hashlib.sha256("\0".join([conn.base_url, "comm_b", "pw-one"]).encode()).hexdigest()[:32]
+    assert conn.fingerprint != plain
+
+
+def test_metadata_parse_is_linear_on_unclosed_tags():
+    import time
+
+    from src.s4hc.client import parse_entity_types
+    hostile = '<EntityType Name="A">' * 20000
+    t0 = time.monotonic()
+    assert parse_entity_types(hostile) == {}
+    assert time.monotonic() - t0 < 1
+    assert parse_entity_types('<EntityType Name="T"><Property Name="X"/></EntityType>') == {"T": '<Property Name="X"/>'}
+
+
+def test_oversized_response_refused(tool):
+    original = fake_s4hc.fake_get
+
+    def huge(self, url, params=None, headers=None, timeout=None, **kw):
+        r = original(self, url, params, headers, timeout, **kw)
+        r.headers = {"Content-Length": str(10**9)}
+        return r
+
+    import requests
+    requests.Session.get = huge
+    try:
+        with pytest.raises(S4HCError, match="QUERY_TOO_LARGE"):
+            tool("list_company_codes")(ctx=None)
+    finally:
+        requests.Session.get = original
+
+
+def test_cycling_passwords_cannot_drain_other_tenants(tool, monkeypatch):
+    import asyncio
+
+    from src.s4hc.governance import AuditAndRateLimitMiddleware
+    monkeypatch.setenv("S4HC_RATE_LIMIT_PER_MIN", "3")
+    monkeypatch.setenv("S4HC_RATE_LIMIT_GLOBAL_PER_MIN", "3")
+    mw = AuditAndRateLimitMiddleware()
+
+    class Msg:
+        name, arguments = "fiscal_context", {}
+
+    def call(ctx):
+        class MC:
+            message = Msg()
+            fastmcp_context = ctx
+
+        async def ok(_):
+            return "ok"
+        return asyncio.run(mw.on_call_tool(MC(), ok))
+
+    tool("list_company_codes")(ctx=None)  # the server's own connection is now accepted by SAP
+    refused = 0
+    for i in range(10):  # attacker: same user, a new invented password every call
+        try:
+            call(header_ctx(f"guess-{i}"))
+        except S4HCError:
+            refused += 1
+    assert refused == 7  # they share one unverified bucket of 3
+    assert call(None) == "ok"  # the verified tenant still has its global budget

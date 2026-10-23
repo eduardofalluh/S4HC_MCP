@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 
 from fastmcp import Context, FastMCP
 
@@ -21,6 +22,9 @@ SERVICES = (
      "get_cost_center_postings (document-level detail)"),
     ("API_FINPLANNINGENTRYITEM_SRV", config.PLAN_SERVICE, "A_FinPlanningEntryItem", False, "get_actual_vs_plan"),
 )
+
+
+HEALTH_BUDGET_SECONDS = 60
 
 
 def register(mcp: FastMCP) -> None:
@@ -49,8 +53,12 @@ def register(mcp: FastMCP) -> None:
         except S4HCError as exc:
             return {"status": "error", "error": str(exc), "scope": scope_info, **info}
         checks = {}
+        budget_end = time.monotonic() + HEALTH_BUDGET_SECONDS
         for name, path, entity_set, required, enables in SERVICES:
             check = {"required": required, "enables": enables}
+            if time.monotonic() > budget_end:
+                checks[name] = {**check, "ok": False, "error": f"not checked: health budget of {HEALTH_BUDGET_SECONDS}s used up"}
+                continue
             try:
                 xml = client.get_metadata(path)
                 check["entity_sets"] = re.findall(r'EntitySet Name="([^"]+)"', xml)

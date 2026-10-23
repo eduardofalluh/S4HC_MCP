@@ -16,7 +16,9 @@ host named in a request header.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
+import secrets
 import threading
 import time
 from collections import OrderedDict
@@ -38,6 +40,9 @@ _master_cache: OrderedDict[str, tuple[float, Any]] = OrderedDict()
 _lock = threading.Lock()
 
 HEADER_PREFIX = "x-s4hc-"
+# Keyed per process, so neither cache keys nor the prefixes in audit lines can be
+# used to test password guesses offline.
+_FINGERPRINT_KEY = secrets.token_bytes(32)
 
 
 def _header(ctx: Context | None, name: str) -> str | None:
@@ -80,7 +85,7 @@ class Connection:
         share a cached client or cached result only if this matches."""
         secret = self.password if self.password is not None else repr(self.cert)
         raw = "\0".join([self.base_url, self.user or "", secret or ""])
-        return hashlib.sha256(raw.encode()).hexdigest()[:32]
+        return hmac.new(_FINGERPRINT_KEY, raw.encode(), hashlib.sha256).hexdigest()[:32]
 
 
 def resolve_connection(ctx: Context | None = None) -> Connection:
@@ -129,6 +134,22 @@ def connection_fingerprint(ctx: Context | None = None) -> str:
         return resolve_connection(ctx).fingerprint
     except S4HCError:
         return "unresolved"
+
+
+def rate_limit_key(ctx: Context | None = None) -> tuple[str, bool]:
+    """(bucket key, verified). A connection SAP has already accepted is keyed by
+    its credential fingerprint; one that has not is keyed by host + user only,
+    so cycling invented passwords cannot mint fresh buckets."""
+    try:
+        conn = resolve_connection(ctx)
+    except S4HCError:
+        return "unresolved", False
+    with _lock:
+        client = _cached.get(conn.fingerprint)
+    if client is not None and client.verified:
+        return conn.fingerprint, True
+    return "unverified|" + hmac.new(_FINGERPRINT_KEY, f"{conn.base_url}\0{conn.user or ''}".encode(),
+                                    hashlib.sha256).hexdigest()[:32], False
 
 
 def cached(ctx: Context | None, key: str, loader: Callable[[], Any]) -> Any:

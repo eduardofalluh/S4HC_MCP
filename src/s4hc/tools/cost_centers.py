@@ -9,7 +9,7 @@ from ..client import S4HCError, odata_str, validate_fields, validate_id
 from ..dependencies import get_client, get_defaults
 from ..governance import (allowed_company_codes_for_filter, enforce_company_code, enforce_cost_centers,
                           filter_rows_to_scope, scope_columns)
-from .actuals import envelope
+from .actuals import allowlist_too_big_for_filter, envelope
 
 CURRENT = "ValidityEndDate eq datetime'9999-12-31T00:00:00'"
 
@@ -74,7 +74,8 @@ def register(mcp: FastMCP) -> None:
             conds.append(f"CompanyCode eq {odata_str(validate_id(company_code, 'company_code'))}")
         elif allowed_company_codes_for_filter(ctx, company_code):
             conds.append("(" + " or ".join(f"CompanyCode eq {odata_str(c)}" for c in allowed_company_codes_for_filter(ctx, company_code)) + ")")
-        if scoped_ccs and len(scoped_ccs) > 200:
+        post_filter = bool(scoped_ccs) and not cost_center and allowlist_too_big_for_filter(scoped_ccs)
+        if post_filter:
             scoped_ccs = None  # too many for one filter: filter_rows_to_scope applies the allowlist below
         if scoped_ccs:
             conds.append("(" + " or ".join(f"CostCenter eq {odata_str(validate_id(c, 'cost_center'))}" for c in scoped_ccs) + ")")
@@ -88,11 +89,12 @@ def register(mcp: FastMCP) -> None:
             conds.append(CURRENT)
         flt = " and ".join(conds) or None
         top = max(1, min(top, config.get_max_rows()))
+        fetch_top = None if post_filter else top  # scope first, then cap, or in-scope rows past `top` vanish
 
         try:
             rows, truncated = client.get_all(
                 config.COSTCENTER_SERVICE, "A_CostCenter",
-                select=select + ["to_Text"], filter_=flt, expand=["to_Text"], orderby="CostCenter", top=top,
+                select=select + ["to_Text"], filter_=flt, expand=["to_Text"], orderby="CostCenter", top=fetch_top,
             )
             source = "API_COSTCENTER_SRV"
             out = [_pick_text(r, d.language) for r in rows]
@@ -101,10 +103,12 @@ def register(mcp: FastMCP) -> None:
                 raise
             rows, truncated = client.get_all(
                 config.JOURNAL_ITEM_SERVICE, "A_CostCenter",
-                select=select, filter_=flt, orderby="CostCenter", top=top,
+                select=select, filter_=flt, orderby="CostCenter", top=fetch_top,
             )
             source = "API_JOURNALENTRYITEMBASIC_SRV (fallback, no names — enable SAP_COM_0087 for names)"
             out = rows
         out = filter_rows_to_scope(ctx, out)
+        if len(out) > top:
+            out, truncated = out[:top], True
         return {**envelope(source, truncated=truncated), "count": len(out), "truncated": truncated,
                 "source": source, "language": d.language, "cost_centers": out}

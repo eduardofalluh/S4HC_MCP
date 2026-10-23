@@ -7,9 +7,10 @@ import re
 from fastmcp import Context, FastMCP
 
 from .. import config
-from ..client import S4HCError
+from ..client import S4HCError, parse_entity_types
 from ..dependencies import cached, get_client
 from ..governance import get_scope
+from .actuals import DATA_NOTICE
 
 SERVICES = {
     "costcenter": config.COSTCENTER_SERVICE,
@@ -22,6 +23,19 @@ SERVICES = {
 _SAFE_SERVICE = re.compile(r"^/sap/opu/odata/sap/[A-Z0-9_]+(_SRV|_CDS)?$", re.I)
 _SAFE_ENTITY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,60}$")
 _SAFE_PARAM = re.compile(r"^\$(select|filter|expand|orderby|top|skip|inlinecount)$")
+
+
+def _drop_person_fields(row: dict) -> dict:
+    out = {}
+    for k, v in row.items():
+        if k in config.PERSON_FIELDS:
+            continue
+        if isinstance(v, dict) and isinstance(v.get("results"), list):
+            v = {**v, "results": [_drop_person_fields(r) for r in v["results"] if isinstance(r, dict)]}
+        elif isinstance(v, dict):
+            v = _drop_person_fields(v)
+        out[k] = v
+    return out
 
 
 def _service_path(service: str) -> str:
@@ -51,8 +65,7 @@ def register(mcp: FastMCP) -> None:
 
     def _describe(xml: str, path: str) -> dict:
         entities = {}
-        for m in re.finditer(r'<EntityType Name="([^"]+)"(.*?)</EntityType>', xml, re.S):
-            name, body = m.group(1), m.group(2)
+        for name, body in parse_entity_types(xml).items():
             keys = re.findall(r'<PropertyRef Name="([^"]+)"', body)
             props = re.findall(r'<Property Name="([^"]+)" Type="([^"]+)"', body)
             navs = re.findall(r'<NavigationProperty Name="([^"]+)"', body)
@@ -85,6 +98,11 @@ def register(mcp: FastMCP) -> None:
         for k in params:
             if not _SAFE_PARAM.match(k) or k in ("$top", "$skip", "$inlinecount"):
                 raise S4HCError(f"Parameter {k!r} not allowed; use top=", "INVALID_SCOPE")
+        if not config.person_fields_allowed():
+            named = [f for f in config.PERSON_FIELDS if any(f in str(v) for v in params.values())]
+            if named:
+                raise S4HCError(f"{named} identify a person and are not exposed on this deployment "
+                                "(S4HC_EXPOSE_PERSON_FIELDS=false)", "UNSUPPORTED_FIELD")
         rows, truncated = get_client(ctx).get_all(
             _service_path(service), entity_set,
             select=[s for s in params.get("$select", "").split(",") if s] or None,
@@ -93,4 +111,6 @@ def register(mcp: FastMCP) -> None:
             orderby=params.get("$orderby") or None,
             top=max(1, min(top, config.get_max_rows(), config.get_max_inline_rows())),
         )
-        return {"count": len(rows), "truncated": truncated, "rows": rows}
+        if not config.person_fields_allowed():
+            rows = [_drop_person_fields(r) for r in rows]
+        return {"count": len(rows), "truncated": truncated, "data_notice": DATA_NOTICE, "rows": rows}

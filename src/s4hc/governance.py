@@ -54,8 +54,10 @@ def _allowlist(ctx: Context | None, header: str, env: str, what: str) -> frozens
     names nothing inside the ceiling, is refused rather than read as 'no limit'."""
     ceiling = _csv(os.getenv(env) or "")
     raw = _header(ctx, HEADER_PREFIX + header)
-    if raw is None or not raw.strip():  # absent, or an unset template variable
+    if raw is None:
         return ceiling
+    # Present means "scope this connection": a blank value (an unset template
+    # variable) or ',' is refused, never read as "no limit".
     requested = _csv(raw)
     if not requested:
         raise S4HCError(f"x-s4hc-{header} is present but lists no {what}", "UNAUTHORIZED_SCOPE")
@@ -170,9 +172,10 @@ class _TokenBucket:
 
 class AuditAndRateLimitMiddleware(Middleware):
     """Logs every tool call and enforces S4HC_RATE_LIMIT_PER_MIN (default 120)
-    per connection (tenant + credential) and S4HC_RATE_LIMIT_GLOBAL_PER_MIN
-    (default 600) for the whole process, so one busy or looping connection
-    cannot lock every other tenant out."""
+    per connection and S4HC_RATE_LIMIT_GLOBAL_PER_MIN (default 600) across the
+    connections SAP has accepted, so one busy or looping connection cannot lock
+    every other tenant out. Credentials SAP has not accepted yet share one
+    bucket per host + user and never draw on the global budget."""
 
     MAX_BUCKETS = 1024
 
@@ -194,7 +197,7 @@ class AuditAndRateLimitMiddleware(Middleware):
             return b
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):
-        from .dependencies import connection_fingerprint
+        from .dependencies import rate_limit_key
 
         name = getattr(context.message, "name", "?")
         args = getattr(context.message, "arguments", None) or {}
@@ -206,8 +209,10 @@ class AuditAndRateLimitMiddleware(Middleware):
             caller = req.headers.get("x-user-email") or req.headers.get("x-s4hc-user")
         except Exception:  # noqa: BLE001
             pass
-        conn = connection_fingerprint(ctx)
-        if not self._bucket(conn).allow() or not self.global_bucket.allow():
+        conn, verified = rate_limit_key(ctx)
+        # Only connections SAP has accepted draw on the process-wide budget, so a
+        # caller inventing credentials cannot exhaust it for every other tenant.
+        if not self._bucket(conn).allow() or (verified and not self.global_bucket.allow()):
             log.warning("audit tool=%s caller=%s conn=%s outcome=rate_limited", name, caller, conn[:8])
             raise S4HCError("Rate limit exceeded for this connection; retry in a minute", "SAP_RATE_LIMITED")
         t0 = time.monotonic()

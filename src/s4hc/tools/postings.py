@@ -15,7 +15,7 @@ from typing import Any
 from fastmcp import Context, FastMCP
 
 from .. import config
-from ..client import S4HCError, odata_str, validate_id
+from ..client import S4HCError, odata_str, parse_entity_types, validate_id
 from ..dependencies import cached, get_client, get_defaults
 from ..governance import allowed_company_codes_for_filter, enforce_company_code, enforce_cost_centers
 from .actuals import dec, envelope, pad_period, period, resolve_year
@@ -56,8 +56,8 @@ def _discover(ctx: Context | None) -> dict[str, Any]:
     def load():
         xml = get_client(ctx).get_metadata(GLLINEITEM_SERVICE)
         sets = dict(re.findall(r'<EntitySet Name="([^"]+)" EntityType="[^"]*\.([^"]+)"', xml))
-        types = {m.group(1): set(re.findall(r'<Property Name="([^"]+)"', m.group(2)))
-                 for m in re.finditer(r'<EntityType Name="([^"]+)"(.*?)</EntityType>', xml, re.S)}
+        types = {name: set(re.findall(r'<Property Name="([^"]+)"', body))
+                 for name, body in parse_entity_types(xml).items()}
         # pick the entity set whose type has the most of our needed fields
         best, best_score = None, -1
         for es, et in sets.items():

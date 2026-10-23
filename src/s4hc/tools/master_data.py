@@ -23,29 +23,29 @@ CURRENT = "ValidityEndDate eq datetime'9999-12-31T00:00:00'"
 OPTIONAL_MISSING = ("SAP_FORBIDDEN", "SAP_NOT_FOUND")
 
 
-def _profit_center_company_codes(ctx: Context | None) -> tuple[dict[str, set[str]], str]:
+def _profit_center_company_codes(ctx: Context | None) -> tuple[dict[str, set[str]], str, bool]:
     """ProfitCenter -> company codes it is assigned to. In S/4HANA the
     CompanyCode field on the profit center master is normally blank; the real
     (n:m) assignment lives in A_PrftCtrCompanyCodeAssignment."""
-    def load() -> tuple[dict[str, set[str]], str]:
+    def load() -> tuple[dict[str, set[str]], str, bool]:
         client = get_client(ctx)
         out: dict[str, set[str]] = {}
         try:
-            rows, _ = client.get_all(config.PROFITCENTER_SERVICE, "A_PrftCtrCompanyCodeAssignment",
+            rows, truncated = client.get_all(config.PROFITCENTER_SERVICE, "A_PrftCtrCompanyCodeAssignment",
                                      select=["ControllingArea", "ProfitCenter", "CompanyCode"])
             source = "API_PROFITCENTER_SRV/A_PrftCtrCompanyCodeAssignment"
         except S4HCError as exc:
             if exc.code not in OPTIONAL_MISSING:
                 raise
             # Fallback: a profit center belongs to the company codes of the cost centers assigned to it.
-            rows, _ = client.get_all(config.JOURNAL_ITEM_SERVICE, "A_CostCenter",
+            rows, truncated = client.get_all(config.JOURNAL_ITEM_SERVICE, "A_CostCenter",
                                      select=["CostCenter", "ProfitCenter", "CompanyCode", "ValidityEndDate"],
                                      filter_=CURRENT)
             source = "derived from cost center assignments (API_PROFITCENTER_SRV not available)"
         for r in rows:
             if r.get("ProfitCenter") and r.get("CompanyCode"):
                 out.setdefault(str(r["ProfitCenter"]), set()).add(str(r["CompanyCode"]))
-        return out, source
+        return out, source, truncated
 
     return cached(ctx, "pc-company-codes", load)
 
@@ -147,7 +147,7 @@ def register(mcp: FastMCP) -> None:
                                              top=None if wanted_codes else top)
             source = "API_JOURNALENTRYITEMBASIC_SRV (fallback, no names)"
 
-        assignment, assignment_source = _profit_center_company_codes(ctx)
+        assignment, assignment_source, assignment_truncated = _profit_center_company_codes(ctx)
         texts = _texts(ctx, f"pc-text|{d.language}", config.PROFITCENTER_SERVICE, "A_ProfitCenterText",
                        "ProfitCenter", ["ProfitCenterName", "ProfitCenterLongName"],
                        f"Language eq {odata_str(d.language)} and {CURRENT}")
@@ -166,6 +166,10 @@ def register(mcp: FastMCP) -> None:
         if wanted_codes and len(out) > top:
             out, truncated = out[:top], True
         warnings = [] if texts is not None else ["Profit center names unavailable: API_PROFITCENTER_SRV not readable."]
+        if assignment_truncated:
+            warnings.append("The profit center ↔ company code assignment exceeded S4HC_MAX_ROWS; company_codes may be "
+                            "incomplete and company-code filtering may miss profit centers.")
+            truncated = truncated or bool(wanted_codes)
         return {**envelope(source, truncated=truncated, warnings=warnings),
                 "count": len(out), "truncated": truncated, "source": source,
                 "company_code_source": assignment_source, "language": d.language, "profit_centers": out}

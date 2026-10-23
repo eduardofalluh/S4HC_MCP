@@ -125,7 +125,7 @@ class _OriginGuardMiddleware:
 
 
 def _is_loopback(host: str) -> bool:
-    if host in ("localhost", ""):
+    if host == "localhost":
         return True
     try:
         return ipaddress.ip_address(host).is_loopback

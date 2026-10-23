@@ -48,5 +48,5 @@ shape as the sibling `CALM_MCP` repo.
 - `S4HC_BASE_URL` is the `-api` host. The Fiori host answers with a redirect, which the client refuses with `NOT_CONFIGURED`.
 - Two code paths resolve the same client: env vars (single-tenant) and `x-s4hc-*` headers (multi-tenant). A header base URL other than the env one must bring header credentials.
 - `tests/conftest.py` sets `S4HC_PAGE_SIZE=2` to force paging, generates throwaway credentials per run, and blocks any non-loopback socket connection.
-- In a Claude Code sandbox that denies `**/*credentials*`, `fastmcp/client/auth/client_credentials.py` is unreadable, so tests that import `fastmcp.Client` fail at import; run the suite outside that sandbox.
+- Under a Claude Code sandbox rule that denies reading `**/*credentials*`, `fastmcp/client/auth/client_credentials.py` is unreadable and the tests that import `fastmcp.Client` fail at import. That is the sandbox, not the code: the developer runs the suite locally.
 - `tests/test_http_e2e.py` spawns a real `server.py` subprocess on a free loopback port with the fake backend injected via `sitecustomize`.
