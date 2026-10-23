@@ -253,12 +253,28 @@ def test_rate_limit_middleware(monkeypatch):
         asyncio.run(mw.on_call_tool(Ctx(), ok))
 
 
-def test_audit_log_has_no_secrets(caplog, tool):
+def test_audit_log_has_no_secrets(caplog):
+    """Goes through the real MCP call path (middleware included) and checks every
+    log line, not just audit ones, for the password as a substring."""
+    import asyncio
     import logging
-    caplog.set_level(logging.INFO, logger="s4hc-mcp.audit")
-    # the middleware is exercised via the HTTP e2e; here we check the logger never sees env creds
-    tool("list_company_codes")(ctx=None)
-    assert "p" not in [r.getMessage() for r in caplog.records]  # trivial guard: password value never logged verbatim
+
+    from fastmcp import Client
+
+    import server
+    from conftest import TEST_PASSWORD
+
+    caplog.set_level(logging.DEBUG)
+
+    async def run():
+        async with Client(server.mcp) as c:
+            await c.call_tool("list_company_codes", {"company_code": "1010"})
+            await c.call_tool("s4hc_health", {"live": True})
+
+    asyncio.run(run())
+    audit = [r.getMessage() for r in caplog.records if r.name == "s4hc-mcp.audit"]
+    assert any("tool=list_company_codes" in m and "outcome=ok" in m for m in audit)  # the middleware really ran
+    assert all(TEST_PASSWORD not in r.getMessage() for r in caplog.records)
 
 
 # ---------------------------------------------------------------- compare

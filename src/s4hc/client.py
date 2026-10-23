@@ -2,43 +2,34 @@
 
 GET only. Handles Basic / X.509 auth, JSON format, $top/$skip paging,
 __next links, retry with backoff on 429/5xx, SAP /Date()/ normalisation,
-and a hard row ceiling. Never logs credentials or row data.
+a hard row ceiling and one wall-clock deadline per paged read. Never follows
+redirects (they could carry the credentials elsewhere). Never logs
+credentials or row data.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import re
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Iterable
 
 import requests
 
 from . import config
+from .errors import S4HCError
+
+__all__ = ["S4HCClient", "S4HCError", "normalize_row", "normalize_value", "odata_str", "validate_fields", "validate_id"]
 
 log = logging.getLogger("s4hc-mcp.client")
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_\-./ ]{1,40}$")
 _SAP_DATE = re.compile(r"^/Date\((-?\d+)(?:[+-]\d+)?\)/$")
 RETRY_STATUS = {429, 502, 503, 504}
-
-
-class S4HCError(RuntimeError):
-    """Application error with a stable code the agent can branch on.
-
-    Codes: INVALID_SCOPE, UNAUTHORIZED_SCOPE, UNSUPPORTED_FIELD, PLAN_UNAVAILABLE,
-    QUERY_TOO_LARGE, MIXED_CURRENCY, SAP_UNAUTHORIZED, SAP_FORBIDDEN, SAP_NOT_FOUND,
-    SAP_RATE_LIMITED, SAP_UNAVAILABLE, INCOMPLETE_RESULT, METADATA_MISMATCH,
-    NOT_CONFIGURED, DISABLED.
-    """
-
-    RETRYABLE = {"SAP_RATE_LIMITED", "SAP_UNAVAILABLE"}
-
-    def __init__(self, message: str, code: str = "INVALID_SCOPE") -> None:
-        self.code = code
-        self.retryable = code in self.RETRYABLE
-        super().__init__(f"[{code}] {message}")
+MAX_RETRY_WAIT = 30.0
 
 
 def odata_str(value: str) -> str:
@@ -55,9 +46,14 @@ def validate_id(value: str, what: str) -> str:
 
 def validate_fields(fields: Iterable[str], allowed: Iterable[str], what: str) -> list[str]:
     allowed_set = set(allowed)
+    if not config.person_fields_allowed():
+        allowed_set -= config.PERSON_FIELDS
     out: list[str] = []
     for f in fields:
         f = str(f).strip()
+        if f in config.PERSON_FIELDS and not config.person_fields_allowed():
+            raise S4HCError(f"{f} identifies a person and is not exposed on this deployment "
+                            "(S4HC_EXPOSE_PERSON_FIELDS=false)", "UNSUPPORTED_FIELD")
         if f not in allowed_set:
             raise S4HCError(f"Unknown {what} field {f!r}. Allowed: {sorted(allowed_set)}", "UNSUPPORTED_FIELD")
         if f not in out:
@@ -94,6 +90,25 @@ def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _retry_after(value: str | None, attempt: int) -> float:
+    """Seconds to wait before a retry: Retry-After as seconds or an HTTP-date,
+    else exponential backoff. Never negative, never above MAX_RETRY_WAIT."""
+    fallback = 0.5 * 2**attempt
+    if value:
+        try:
+            wait = float(value)
+        except ValueError:
+            try:
+                wait = (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds()
+            except (TypeError, ValueError, IndexError, OverflowError):
+                wait = fallback
+        if not math.isfinite(wait):
+            wait = fallback
+    else:
+        wait = fallback
+    return min(max(wait, 0.0), MAX_RETRY_WAIT)
+
+
 class S4HCClient:
     def __init__(
         self,
@@ -119,29 +134,44 @@ class S4HCClient:
         self.session.headers.update({"Accept": "application/json"})
 
     # ------------------------------------------------------------------ http
-    def _request(self, url: str, params: dict[str, Any] | None = None, accept: str = "application/json"):
+    def _request(self, url: str, params: dict[str, Any] | None = None, accept: str = "application/json",
+                 deadline: float | None = None):
+        deadline = deadline or time.monotonic() + config.get_request_deadline()
         last_exc: Exception | None = None
         for attempt in range(self.retries + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             try:
-                r = self.session.get(url, params=params, headers={"Accept": accept}, timeout=self.timeout)
+                r = self.session.get(url, params=params, headers={"Accept": accept},
+                                     timeout=min(self.timeout, remaining), allow_redirects=False)
             except requests.RequestException as exc:
                 last_exc = exc
                 if attempt < self.retries:
-                    time.sleep(0.5 * 2**attempt)
+                    time.sleep(min(0.5 * 2**attempt, max(deadline - time.monotonic(), 0)))
                     continue
                 raise S4HCError(f"Connection error to S/4HANA Cloud: {exc.__class__.__name__}", "SAP_UNAVAILABLE") from exc
             if r.status_code in RETRY_STATUS and attempt < self.retries:
-                wait = float(r.headers.get("Retry-After") or 0.5 * 2**attempt)
+                wait = _retry_after(r.headers.get("Retry-After"), attempt)
+                if time.monotonic() + wait >= deadline:
+                    return r
                 log.warning("HTTP %s from S/4HANA Cloud, retrying in %.1fs", r.status_code, wait)
-                time.sleep(min(wait, 30))
+                time.sleep(wait)
                 continue
             return r
-        raise S4HCError(f"Request failed after retries: {last_exc.__class__.__name__ if last_exc else 'unknown'}", "SAP_UNAVAILABLE")
+        if last_exc is not None:
+            raise S4HCError(f"Request failed after retries: {last_exc.__class__.__name__}", "SAP_UNAVAILABLE")
+        raise S4HCError(f"S/4HANA Cloud did not answer within {config.get_request_deadline():.0f}s", "SAP_UNAVAILABLE")
 
     def _raise_for_status(self, r: requests.Response, url: str) -> None:
-        if r.status_code < 400:
+        if r.status_code < 300:
             return
         path = url.replace(self.base_url, "").split("?")[0]
+        if r.status_code < 400:
+            raise S4HCError(
+                f"HTTP {r.status_code} redirect on {path}, not followed — S4HC_BASE_URL must be the "
+                "tenant's API host (https://<tenant>-api.s4hana.cloud.sap), not the Fiori launchpad host",
+                "NOT_CONFIGURED")
         if r.status_code == 401:
             raise S4HCError("401 Unauthorized — check the communication user / certificate", "SAP_UNAUTHORIZED")
         if r.status_code == 403:
@@ -163,20 +193,26 @@ class S4HCClient:
             msg = (r.text or "")[:300]
         raise S4HCError(f"HTTP {r.status_code}: {msg}", "INVALID_SCOPE")
 
-    def _get(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        r = self._request(url, params)
+    def _get(self, url: str, params: dict[str, Any] | None = None, deadline: float | None = None) -> dict[str, Any]:
+        r = self._request(url, params, deadline=deadline)
         self._raise_for_status(r, url)
         try:
-            return r.json()
+            data = r.json()
         except ValueError as exc:
             raise S4HCError("Non-JSON response from S/4HANA Cloud", "SAP_UNAVAILABLE") from exc
+        return data if isinstance(data, dict) else {}
 
     def get_metadata(self, service_path: str) -> str:
         url = f"{self.base_url}{service_path}/$metadata"
         r = self._request(url, accept="application/xml")
-        if r.status_code >= 400:
-            self._raise_for_status(r, url)
+        self._raise_for_status(r, url)
         return r.text
+
+    def probe(self, service_path: str, entity_set: str) -> None:
+        """Read one row (or none) to prove the user may *start* the service:
+        $metadata can be readable while data access is still forbidden."""
+        url = f"{self.base_url}{service_path}/{entity_set}"
+        self._get(url, {"$format": "json", "$top": 1})
 
     # ---------------------------------------------------------------- paging
     def get_all(
@@ -191,11 +227,15 @@ class S4HCClient:
         top: int | None = None,
         max_rows: int | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
-        """Return (rows, truncated). Pages with $top/$skip or __next."""
+        """Return (rows, truncated). Follows SAP's __next links whenever they
+        are present; otherwise pages with $top/$skip. One extra row beyond the
+        ceiling is requested so `truncated` is exact, not a guess."""
         page = config.get_page_size()
         ceiling = min(max_rows or config.get_max_rows(), top or 10**9)
+        want = ceiling + 1
+        deadline = time.monotonic() + config.get_request_deadline()
         url = f"{self.base_url}{service_path}/{entity_set}"
-        params: dict[str, Any] = {"$format": "json", "$top": min(page, ceiling), "$skip": 0}
+        params: dict[str, Any] = {"$format": "json", "$top": min(page, want), "$skip": 0}
         if select:
             params["$select"] = ",".join(select)
         if filter_:
@@ -207,6 +247,7 @@ class S4HCClient:
 
         rows: list[dict[str, Any]] = []
         next_url: str | None = None
+        followed_next = False
         seen_links: set[str] = set()
         pages = 0
         allowed_prefix = f"{self.base_url}{service_path}/"
@@ -215,26 +256,31 @@ class S4HCClient:
             if pages > config.get_max_pages():
                 raise S4HCError(
                     f"More than {config.get_max_pages()} pages needed; narrow the filter", "QUERY_TOO_LARGE")
-            data = self._get(next_url or url, None if next_url else params)
-            results = data.get("d", {}).get("results", [])
+            asked = params["$top"]
+            data = self._get(next_url or url, None if next_url else params, deadline=deadline)
+            body = data.get("d", {})
+            body = body if isinstance(body, dict) else {}
+            results = body.get("results", [])
             if not isinstance(results, list):
                 results = []
             for row in results:
                 if isinstance(row, dict):
                     rows.append(normalize_row(row))
-            if len(rows) >= ceiling:
-                return rows[:ceiling], len(results) >= params["$top"]
-            if len(results) < params["$top"]:
-                return rows, False
-            next_url = data.get("d", {}).get("__next")
-            if next_url:
+            if len(rows) >= want:
+                return rows[:ceiling], True
+            next_link = body.get("__next")
+            if next_link:
                 # Follow continuation links only on the configured origin AND service path,
                 # never with embedded credentials, never the same link twice.
-                if not next_url.startswith(allowed_prefix) or "@" in next_url.split("?")[0]:
+                if not isinstance(next_link, str) or not next_link.startswith(allowed_prefix) \
+                        or "@" in next_link.split("?")[0]:
                     raise S4HCError("SAP returned a continuation link outside the configured service", "INCOMPLETE_RESULT")
-                if next_url in seen_links:
+                if next_link in seen_links:
                     raise S4HCError("SAP returned a repeated continuation link", "INCOMPLETE_RESULT")
-                seen_links.add(next_url)
-            if not next_url:
-                params["$skip"] += params["$top"]
-                params["$top"] = min(page, ceiling - len(rows))
+                seen_links.add(next_link)
+                next_url, followed_next = next_link, True
+                continue
+            if followed_next or len(results) < asked:
+                return rows, False
+            params["$skip"] += asked
+            params["$top"] = min(page, want - len(rows))

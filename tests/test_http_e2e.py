@@ -115,7 +115,7 @@ def test_full_flow_over_http(server_url):
     trend = call(server_url, "cost_center_trend", headers=TENANT, cost_centers=["CC100"], fiscal_year_from=2026, fiscal_year_to=2026)
     assert "2026/006" in trend["cost_centers"][0]["anomalous_periods"]
     csv_out = call(server_url, "export_actuals_csv", headers=TENANT, fiscal_year=2026, cost_centers=["CC300"])
-    assert csv_out["rows"] == 1 and csv_out["csv"].splitlines()[1].startswith("CC300,IT")
+    assert csv_out["row_count"] == 1 and csv_out["csv"].splitlines()[1].startswith("CC300,IT")
 
 
 def test_scope_headers_enforced_over_http(server_url):
@@ -127,7 +127,37 @@ def test_scope_headers_enforced_over_http(server_url):
     err = call(server_url, "list_company_codes", headers=hdr, company_code="1710")
     assert "outside" in err["__error__"]
     health = call(server_url, "s4hc_health", headers=hdr)
-    assert health["scope"] if "scope" in health else True
+    assert health["scope"] == {"allowed_company_codes": ["1010"], "allowed_cost_centers": ["CC300"]}
+
+
+def test_header_credentials_never_mixed_or_redirected(server_url):
+    # A caller-chosen host without its own credentials is refused (the server would otherwise lend its own).
+    err = call(server_url, "list_company_codes", headers={"x-s4hc-base-url": "https://other-api.s4hana.cloud.sap"})
+    assert "NOT_CONFIGURED" in err["__error__"]
+    # User without password never borrows anyone else's password.
+    err = call(server_url, "list_company_codes", headers={**TENANT, "x-s4hc-password": ""})
+    assert "NOT_CONFIGURED" in err["__error__"]
+    # A host outside the SAP API domains is refused before any request is made.
+    err = call(server_url, "list_company_codes", headers={**TENANT, "x-s4hc-base-url": "https://internal.example.com"})
+    assert "not an allowed" in err["__error__"]
+    # An allowlist header that lists nothing does not mean "unrestricted".
+    err = call(server_url, "list_company_codes", headers={**TENANT, "x-s4hc-allowed-company-codes": ","})
+    assert "UNAUTHORIZED_SCOPE" in err["__error__"]
+
+
+def test_browser_origin_refused(server_url):
+    import requests
+    r = requests.post(server_url, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                      headers={"Accept": "application/json, text/event-stream", "Origin": "https://evil.example.com"})
+    assert r.status_code == 403
+
+
+def test_http_refuses_public_bind_without_key():
+    env = {k: v for k, v in os.environ.items() if not k.startswith("S4HC_")}
+    env["LOG_LEVEL"] = "ERROR"
+    proc = subprocess.run([sys.executable, "server.py", "--http", "--host", "0.0.0.0", "--port", str(_free_port())],
+                          cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 2 and "S4HC_MCP_API_KEY" in proc.stderr
 
 
 def test_language_header_changes_names(server_url):

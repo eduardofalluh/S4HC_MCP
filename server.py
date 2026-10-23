@@ -35,19 +35,22 @@ Run s4hc_health(live=true) to confirm what responds.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import logging
 import os
 import sys
 
 from dotenv import load_dotenv
-from fastmcp import FastMCP
-from starlette.middleware import Middleware
-from starlette.types import ASGIApp, Receive, Scope, Send
 
-from src.s4hc.governance import AuditAndRateLimitMiddleware
-from src.s4hc.tools import actuals, analysis, cost_centers, health, master_data, odata_read, plan, postings
-
+# Before any src.s4hc import: config reads service paths and cache sizes at import time.
 load_dotenv()
+
+from fastmcp import FastMCP  # noqa: E402
+from starlette.middleware import Middleware  # noqa: E402
+from starlette.types import ASGIApp, Receive, Scope, Send  # noqa: E402
+
+from src.s4hc.governance import AuditAndRateLimitMiddleware  # noqa: E402
+from src.s4hc.tools import actuals, analysis, cost_centers, health, master_data, odata_read, plan, postings  # noqa: E402
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -99,6 +102,37 @@ class _InboundKeyMiddleware:
         await self.app(scope, receive, send)
 
 
+class _OriginGuardMiddleware:
+    """Refuse browser-originated requests (DNS rebinding, drive-by pages): a
+    browser always sends Origin on a cross-site POST, MCP clients do not. Allow
+    specific origins with S4HC_ALLOWED_ORIGINS (comma list) if a web client
+    legitimately calls /mcp."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+        self.allowed = {o.strip().rstrip("/").lower().encode()
+                        for o in os.getenv("S4HC_ALLOWED_ORIGINS", "").split(",") if o.strip()}
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            origin = next((v for k, v in scope.get("headers", []) if k.lower() == b"origin"), None)
+            if origin and origin.rstrip(b"/").lower() not in self.allowed:
+                await send({"type": "http.response.start", "status": 403,
+                            "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body", "body": b'{"error":"origin not allowed"}'})
+                return
+        await self.app(scope, receive, send)
+
+
+def _is_loopback(host: str) -> bool:
+    if host in ("localhost", ""):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 mcp = FastMCP("sap-s4hana-cloud")
 
 # Audit log of every tool call + MCP-level rate limit (SAP ref-arch 137800 / API Policy §2.1)
@@ -134,7 +168,12 @@ def main() -> None:
     _startup_check()
 
     if args.http:
-        middleware = [Middleware(_InboundKeyMiddleware)]
+        no_auth_ok = os.getenv("S4HC_MCP_ALLOW_UNAUTHENTICATED", "false").lower() in ("1", "true", "yes")
+        if not os.getenv("S4HC_MCP_API_KEY") and not _is_loopback(args.host) and not no_auth_ok:
+            log.error("Refusing to serve /mcp on %s without S4HC_MCP_API_KEY. Set the key, or set "
+                      "S4HC_MCP_ALLOW_UNAUTHENTICATED=true if the platform authenticates callers.", args.host)
+            sys.exit(2)
+        middleware = [Middleware(_OriginGuardMiddleware), Middleware(_InboundKeyMiddleware)]
         if os.getenv("MCP_TRUST_PROXY", "true").lower() in ("1", "true", "yes"):
             middleware.append(Middleware(_TrustProxyMiddleware))
         if os.getenv("S4HC_MCP_API_KEY"):

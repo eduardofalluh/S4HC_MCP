@@ -8,7 +8,7 @@ from fastmcp import Context, FastMCP
 
 from .. import config
 from ..client import S4HCError
-from ..dependencies import get_client
+from ..dependencies import cached, get_client
 from ..governance import get_scope
 
 SERVICES = {
@@ -16,6 +16,8 @@ SERVICES = {
     "journalentryitem": config.JOURNAL_ITEM_SERVICE,
     "plan": config.PLAN_SERVICE,
     "gllineitem": config.GLLINEITEM_SERVICE,
+    "profitcenter": config.PROFITCENTER_SERVICE,
+    "glaccount": config.GLACCOUNT_SERVICE,
 }
 _SAFE_SERVICE = re.compile(r"^/sap/opu/odata/sap/[A-Z0-9_]+(_SRV|_CDS)?$", re.I)
 _SAFE_ENTITY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,60}$")
@@ -39,11 +41,15 @@ def register(mcp: FastMCP) -> None:
     def describe_service(ctx: Context, service: str = "journalentryitem") -> dict:
         """Read $metadata of an S/4HANA Cloud OData service and list its entity
         sets, keys and properties. service = costcenter | journalentryitem |
-        any released API_* service | a custom YY1_*_CDS service exposed via a
-        Custom Communication Scenario. Use it to confirm field names on a
-        specific tenant before building a custom query.
+        plan | gllineitem | profitcenter | glaccount | any released API_*
+        service | a custom YY1_*_CDS service exposed via a Custom Communication
+        Scenario. Use it to confirm field names on a specific tenant before
+        building a custom query. Cached for 10 minutes.
         """
-        xml = get_client(ctx).get_metadata(_service_path(service))
+        path = _service_path(service)
+        return cached(ctx, f"describe|{path}", lambda: _describe(get_client(ctx).get_metadata(path), path))
+
+    def _describe(xml: str, path: str) -> dict:
         entities = {}
         for m in re.finditer(r'<EntityType Name="([^"]+)"(.*?)</EntityType>', xml, re.S):
             name, body = m.group(1), m.group(2)
@@ -52,7 +58,7 @@ def register(mcp: FastMCP) -> None:
             navs = re.findall(r'<NavigationProperty Name="([^"]+)"', body)
             entities[name] = {"keys": keys, "properties": [f"{n} ({t.replace('Edm.', '')})" for n, t in props], "navigation": navs}
         sets = dict(re.findall(r'<EntitySet Name="([^"]+)" EntityType="[^"]*\.([^"]+)"', xml))
-        return {"service": _service_path(service), "entity_sets": sets, "entity_types": entities}
+        return {"service": path, "entity_sets": sets, "entity_types": entities}
 
     @mcp.tool()
     def s4hc_odata_read(
@@ -85,6 +91,6 @@ def register(mcp: FastMCP) -> None:
             filter_=params.get("$filter") or None,
             expand=[s for s in params.get("$expand", "").split(",") if s] or None,
             orderby=params.get("$orderby") or None,
-            top=max(1, min(top, config.get_max_rows())),
+            top=max(1, min(top, config.get_max_rows(), config.get_max_inline_rows())),
         )
         return {"count": len(rows), "truncated": truncated, "rows": rows}

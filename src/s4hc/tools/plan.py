@@ -16,10 +16,9 @@ from fastmcp import Context, FastMCP
 
 from .. import config
 from ..client import S4HCError, odata_str, validate_id
-from .actuals import envelope, fetch_actuals, pct, resolve_year, totals_by
+from .actuals import ensure_single_currency, envelope, fetch_actuals, pct, resolve_year, totals_by
 
-NAME_FOR = {"CostCenter": "CostCenterName", "GLAccount": "GLAccountName", "ProfitCenter": "ProfitCenterName",
-            "FunctionalArea": "FunctionalAreaName", "CompanyCode": "CompanyCodeName"}
+NAME_FOR = {k: v for k, v in config.NAME_FOR.items() if k in config.PLAN_DIMENSIONS and v in config.PLAN_DIMENSIONS}
 
 
 def _plan(ctx, *, dims, planning_category, **kw):
@@ -55,20 +54,23 @@ def register(mcp: FastMCP) -> None:
         controlling_area: str | None = None,
         ledger: str | None = None,
         currency: str = "company",
+        cost_center_lines_only: bool = True,
         top_n: int = 50,
     ) -> dict:
         """Actual vs plan per dimension (CostCenter by default, or GLAccount,
         ProfitCenter, FunctionalArea, ...): actual, plan, variance =
         actual − plan, consumption % = actual / plan, coverage of keys that
         exist only on one side. Call WITHOUT planning_category first to list
-        the plan categories that hold data for the scope (e.g. PLN, PLN01) —
-        never assume one. "actual_above_plan" is neutral: for costs it means
-        over plan, for revenue accounts it means ahead of plan.
+        the plan categories that hold data for the scope (e.g. PLN, BUDGET01) —
+        never assume one. Both sides keep only lines posted to a cost center
+        unless cost_center_lines_only=false. "actual_above_plan" is neutral: for
+        costs it means over plan, for revenue accounts it means ahead of plan.
         """
         fy = resolve_year(fiscal_year)
         common = dict(currency=currency, fiscal_year=fy, period_from=period_from, period_to=period_to, ledger=ledger,
                       company_code=company_code, controlling_area=controlling_area,
-                      cost_centers=cost_centers, gl_accounts=gl_accounts)
+                      cost_centers=cost_centers, gl_accounts=gl_accounts,
+                      cost_center_lines_only=cost_center_lines_only)
         if not planning_category:
             rows = _plan(ctx, dims=["PlanningCategory"], planning_category=None, **common)
             cats = totals_by(rows, "PlanningCategory")
@@ -86,9 +88,7 @@ def register(mcp: FastMCP) -> None:
         plan_rows = _plan(ctx, dims=dims, planning_category=planning_category, **common)
         if not plan_rows:
             raise S4HCError(f"Planning category {planning_category!r} has no data in {fy} for this scope", "PLAN_UNAVAILABLE")
-        curs = {r.get("Currency") for r in actual_rows + plan_rows if r.get("Currency")}
-        if len(curs) > 1:
-            raise S4HCError(f"Actual and plan are in different currencies {sorted(curs)}", "MIXED_CURRENCY")
+        curs = ensure_single_currency(actual_rows, plan_rows, what="Actual and plan")
 
         a, p = totals_by(actual_rows, dimension), totals_by(plan_rows, dimension)
         names = {str(r.get(dimension)): r.get(NAME_FOR.get(dimension, "")) for r in actual_rows + plan_rows}
@@ -106,7 +106,7 @@ def register(mcp: FastMCP) -> None:
         return {
             **envelope(f"{config.JOURNAL_ITEM_SERVICE} + {config.PLAN_SERVICE}", warnings=warnings),
             "fiscal_year": fy, "periods": [period_from, period_to], "planning_category": planning_category,
-            "dimension": dimension, "currency": sorted(curs),
+            "dimension": dimension, "currency": curs,
             "actual_total": str(ta), "plan_total": str(tp), "variance": str(ta - tp), "variance_pct": pct(ta, tp),
             "consumption_pct": str(round(ta / tp * 100, 1)) if tp else None,
             "items": items[: max(1, top_n)], "distinct_values": len(items),

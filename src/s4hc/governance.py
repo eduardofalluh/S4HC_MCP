@@ -5,7 +5,8 @@ API Policy v.4.2026a §2.1 / §2.2.2:
 * backend-enforced data scope (allowed company codes / cost centers),
 * audit log of every tool call (tool, scope keys, duration, outcome — never
   credentials, never row data),
-* MCP-level rate limit that stays below the SAP API's own limits.
+* MCP-level rate limit per connection, plus a global ceiling, that stays below
+  the SAP API's own limits.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import logging
 import os
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 
 from fastmcp import Context
@@ -35,14 +36,33 @@ SCOPE_ARG_KEYS = (
 def _header(ctx: Context | None, name: str) -> str | None:
     try:
         request = ctx.request_context.request  # type: ignore[union-attr]
-        v = request.headers.get(name) if request is not None else None
-        return v.strip() if v else None
+        if request is None:
+            return None
+        v = request.headers.get(name)
+        return v if v is not None else None
     except Exception:  # noqa: BLE001
         return None
 
 
-def _csv(value: str | None) -> set[str]:
-    return {validate_id(v, "allowlist entry") for v in (value or "").split(",") if v.strip()}
+def _csv(value: str) -> frozenset[str]:
+    return frozenset(validate_id(v, "allowlist entry") for v in value.split(",") if v.strip())
+
+
+def _allowlist(ctx: Context | None, header: str, env: str, what: str) -> frozenset[str]:
+    """Effective allowlist. The deployment's env list is a ceiling a connection
+    header can only narrow; a header that is present but names nothing, or
+    names nothing inside the ceiling, is refused rather than read as 'no limit'."""
+    ceiling = _csv(os.getenv(env) or "")
+    raw = _header(ctx, HEADER_PREFIX + header)
+    if raw is None or not raw.strip():  # absent, or an unset template variable
+        return ceiling
+    requested = _csv(raw)
+    if not requested:
+        raise S4HCError(f"x-s4hc-{header} is present but lists no {what}", "UNAUTHORIZED_SCOPE")
+    effective = requested & ceiling if ceiling else requested
+    if not effective:
+        raise S4HCError(f"x-s4hc-{header} names no {what} inside this deployment's {env}", "UNAUTHORIZED_SCOPE")
+    return effective
 
 
 @dataclass(frozen=True)
@@ -57,8 +77,8 @@ class Scope:
 
 def get_scope(ctx: Context | None = None) -> Scope:
     return Scope(
-        company_codes=frozenset(_csv(_header(ctx, HEADER_PREFIX + "allowed-company-codes") or os.getenv("S4HC_ALLOWED_COMPANY_CODES"))),
-        cost_centers=frozenset(_csv(_header(ctx, HEADER_PREFIX + "allowed-cost-centers") or os.getenv("S4HC_ALLOWED_COST_CENTERS"))),
+        company_codes=_allowlist(ctx, "allowed-company-codes", "S4HC_ALLOWED_COMPANY_CODES", "company codes"),
+        cost_centers=_allowlist(ctx, "allowed-cost-centers", "S4HC_ALLOWED_COST_CENTERS", "cost centers"),
     )
 
 
@@ -66,7 +86,7 @@ def enforce_company_code(ctx: Context | None, company_code: str | None) -> str |
     """Return the company code to query with. Raises if outside the allowlist.
     With an allowlist of exactly one code and no request value, that code is
     applied automatically; with several and no request value, the caller must
-    use enforce_company_codes_filter()."""
+    also apply allowed_company_codes_for_filter()."""
     scope = get_scope(ctx)
     if not scope.company_codes:
         return company_code
@@ -100,16 +120,30 @@ def enforce_cost_centers(ctx: Context | None, cost_centers: list[str] | None) ->
     return cost_centers
 
 
-def filter_rows_to_scope(ctx: Context | None, rows: list[dict], cc_key: str = "CostCenter", co_key: str = "CompanyCode") -> list[dict]:
-    """Post-filter for entity sets where the allowlist cannot be pushed into $filter."""
+def scope_columns(ctx: Context | None, cc_key: str | None = "CostCenter", co_key: str | None = "CompanyCode") -> list[str]:
+    """Columns a listing must select so filter_rows_to_scope can check every row."""
+    scope = get_scope(ctx)
+    cols = []
+    if scope.company_codes and co_key:
+        cols.append(co_key)
+    if scope.cost_centers and cc_key:
+        cols.append(cc_key)
+    return cols
+
+
+def filter_rows_to_scope(ctx: Context | None, rows: list[dict], cc_key: str | None = "CostCenter",
+                         co_key: str | None = "CompanyCode") -> list[dict]:
+    """Post-filter for entity sets where the allowlist cannot be pushed into
+    $filter. Fails closed: a row missing a scoped column is dropped. Pass
+    cc_key/co_key=None for an entity that has no such column at all."""
     scope = get_scope(ctx)
     if not scope.restricted:
         return rows
     out = []
     for r in rows:
-        if scope.cost_centers and cc_key in r and str(r.get(cc_key)) not in scope.cost_centers:
+        if scope.cost_centers and cc_key and str(r.get(cc_key, "")) not in scope.cost_centers:
             continue
-        if scope.company_codes and co_key in r and str(r.get(co_key)) not in scope.company_codes:
+        if scope.company_codes and co_key and str(r.get(co_key, "")) not in scope.company_codes:
             continue
         out.append(r)
     return out
@@ -135,30 +169,54 @@ class _TokenBucket:
 
 
 class AuditAndRateLimitMiddleware(Middleware):
-    """Logs every tool call and enforces S4HC_RATE_LIMIT_PER_MIN (default 120)."""
+    """Logs every tool call and enforces S4HC_RATE_LIMIT_PER_MIN (default 120)
+    per connection (tenant + credential) and S4HC_RATE_LIMIT_GLOBAL_PER_MIN
+    (default 600) for the whole process, so one busy or looping connection
+    cannot lock every other tenant out."""
+
+    MAX_BUCKETS = 1024
 
     def __init__(self) -> None:
-        self.bucket = _TokenBucket(int(os.getenv("S4HC_RATE_LIMIT_PER_MIN", "120")))
+        self.per_connection = int(os.getenv("S4HC_RATE_LIMIT_PER_MIN", "120"))
+        self.global_bucket = _TokenBucket(int(os.getenv("S4HC_RATE_LIMIT_GLOBAL_PER_MIN", "600")))
+        self._buckets: OrderedDict[str, _TokenBucket] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def _bucket(self, key: str) -> _TokenBucket:
+        with self._lock:
+            b = self._buckets.get(key)
+            if b is None:
+                b = self._buckets[key] = _TokenBucket(self.per_connection)
+                while len(self._buckets) > self.MAX_BUCKETS:
+                    self._buckets.popitem(last=False)
+            else:
+                self._buckets.move_to_end(key)
+            return b
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):
+        from .dependencies import connection_fingerprint
+
         name = getattr(context.message, "name", "?")
         args = getattr(context.message, "arguments", None) or {}
         scope_args = {k: args[k] for k in SCOPE_ARG_KEYS if k in args and args[k] not in (None, [], "")}
+        ctx = context.fastmcp_context
         caller = None
         try:
-            req = context.fastmcp_context.request_context.request  # type: ignore[union-attr]
+            req = ctx.request_context.request  # type: ignore[union-attr]
             caller = req.headers.get("x-user-email") or req.headers.get("x-s4hc-user")
         except Exception:  # noqa: BLE001
             pass
-        if not self.bucket.allow():
-            log.warning("audit tool=%s caller=%s outcome=rate_limited", name, caller)
-            raise S4HCError("Rate limit exceeded for this MCP server; retry in a minute", "SAP_RATE_LIMITED")
+        conn = connection_fingerprint(ctx)
+        if not self._bucket(conn).allow() or not self.global_bucket.allow():
+            log.warning("audit tool=%s caller=%s conn=%s outcome=rate_limited", name, caller, conn[:8])
+            raise S4HCError("Rate limit exceeded for this connection; retry in a minute", "SAP_RATE_LIMITED")
         t0 = time.monotonic()
         try:
             result = await call_next(context)
         except Exception as exc:
-            log.info("audit tool=%s caller=%s args=%s ms=%d outcome=error:%s",
-                     name, caller, scope_args, (time.monotonic() - t0) * 1000, exc.__class__.__name__)
+            log.info("audit tool=%s caller=%s conn=%s args=%s ms=%d outcome=error:%s",
+                     name, caller, conn[:8], scope_args, (time.monotonic() - t0) * 1000, exc.__class__.__name__)
             raise
-        log.info("audit tool=%s caller=%s args=%s ms=%d outcome=ok", name, caller, scope_args, (time.monotonic() - t0) * 1000)
+        log.info("audit tool=%s caller=%s conn=%s args=%s ms=%d outcome=ok",
+                 name, caller, conn[:8], scope_args, (time.monotonic() - t0) * 1000)
         return result

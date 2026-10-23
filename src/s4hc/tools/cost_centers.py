@@ -7,7 +7,9 @@ from fastmcp import Context, FastMCP
 from .. import config
 from ..client import S4HCError, odata_str, validate_fields, validate_id
 from ..dependencies import get_client, get_defaults
-from ..governance import allowed_company_codes_for_filter, enforce_company_code, enforce_cost_centers, filter_rows_to_scope
+from ..governance import (allowed_company_codes_for_filter, enforce_company_code, enforce_cost_centers,
+                          filter_rows_to_scope, scope_columns)
+from .actuals import envelope
 
 CURRENT = "ValidityEndDate eq datetime'9999-12-31T00:00:00'"
 
@@ -46,7 +48,10 @@ def register(mcp: FastMCP) -> None:
         single ID; hierarchy_area = standard hierarchy node. only_current keeps
         the validity slice ending 9999-12-31. Use fields to add any A_CostCenter
         property (CompanyCode, ProfitCenter, CostCenterCategory, FunctionalArea,
-        Department, CostCtrResponsiblePersonName, CostCenterStandardHierArea, ...).
+        Department, CostCenterStandardHierArea, ...). Responsible-person fields
+        (CostCtrResponsiblePersonName, CostCtrResponsibleUser) are personal data
+        sent to the model: only available when the deployment sets
+        S4HC_EXPOSE_PERSON_FIELDS=true, and only when asked for in fields.
         Primary source API_COSTCENTER_SRV (SAP_COM_0087); if that arrangement is
         missing it falls back to the same entity inside
         API_JOURNALENTRYITEMBASIC_SRV (then without names — source is reported).
@@ -55,7 +60,7 @@ def register(mcp: FastMCP) -> None:
         d = get_defaults(ctx)
         client = get_client(ctx)
         select = validate_fields(fields or config.COSTCENTER_DEFAULT_SELECT, config.COSTCENTER_FIELDS, "A_CostCenter")
-        for must in ("ControllingArea", "CostCenter", "ValidityEndDate"):
+        for must in ("ControllingArea", "CostCenter", "ValidityEndDate", *scope_columns(ctx)):
             if must not in select:
                 select.append(must)
 
@@ -69,6 +74,8 @@ def register(mcp: FastMCP) -> None:
             conds.append(f"CompanyCode eq {odata_str(validate_id(company_code, 'company_code'))}")
         elif allowed_company_codes_for_filter(ctx, company_code):
             conds.append("(" + " or ".join(f"CompanyCode eq {odata_str(c)}" for c in allowed_company_codes_for_filter(ctx, company_code)) + ")")
+        if scoped_ccs and len(scoped_ccs) > 200:
+            scoped_ccs = None  # too many for one filter: filter_rows_to_scope applies the allowlist below
         if scoped_ccs:
             conds.append("(" + " or ".join(f"CostCenter eq {odata_str(validate_id(c, 'cost_center'))}" for c in scoped_ccs) + ")")
         if profit_center:
@@ -99,4 +106,5 @@ def register(mcp: FastMCP) -> None:
             source = "API_JOURNALENTRYITEMBASIC_SRV (fallback, no names — enable SAP_COM_0087 for names)"
             out = rows
         out = filter_rows_to_scope(ctx, out)
-        return {"count": len(out), "truncated": truncated, "source": source, "language": d.language, "cost_centers": out}
+        return {**envelope(source, truncated=truncated), "count": len(out), "truncated": truncated,
+                "source": source, "language": d.language, "cost_centers": out}

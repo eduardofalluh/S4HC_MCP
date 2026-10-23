@@ -13,18 +13,15 @@ from typing import Any
 from fastmcp import Context, FastMCP
 
 from .. import config
-from ..client import S4HCError
-from ..dependencies import get_defaults
-from .actuals import DEFAULT_DIMS, dec, envelope, fetch_actuals, pct, resolve_year, totals_by
+from ..client import S4HCError, odata_str, validate_id
+from ..dependencies import get_client, get_defaults
+from ..governance import enforce_company_code
+from .actuals import (DEFAULT_DIMS, dec, ensure_single_currency, envelope, fetch_actuals, inline_top, pct, period,
+                      resolve_year, totals_by)
 
-NAME_FOR = {
-    "CostCenter": "CostCenterName", "ProfitCenter": "ProfitCenterName", "GLAccount": "GLAccountName",
-    "FunctionalArea": "FunctionalAreaName", "CompanyCode": "CompanyCodeName", "BusinessArea": "BusinessAreaName",
-    "Segment": "SegmentName", "PartnerCostCenter": "PartnerCostCenterName",
-    "PartnerProfitCenter": "PartnerProfitCenterName", "Plant": "PlantName", "Customer": "CustomerName",
-    "CostCtrActivityType": "CostCtrActivityTypeName", "Project": "ProjectDescription",
-    "WBSElement": "WBSElementDescription", "Ledger": "LedgerName",
-}
+NAME_FOR = config.NAME_FOR
+MIN_PERIODS_FOR_ANOMALY = 4
+_CSV_FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
 
 
 def _year_period_range(fy_from: int, p_from: int, fy_to: int, p_to: int) -> list[tuple[int, int, int]]:
@@ -33,10 +30,20 @@ def _year_period_range(fy_from: int, p_from: int, fy_to: int, p_to: int) -> list
         raise S4HCError("from must be before to", "INVALID_SCOPE")
     if fy_to - fy_from > 3:
         raise S4HCError("trend range limited to 4 fiscal years", "QUERY_TOO_LARGE")
+    if not (1 <= p_from <= 16 and 1 <= p_to <= 16):
+        raise S4HCError("period_from/period_to must be between 1 and 16", "INVALID_SCOPE")
     chunks = []
     for y in range(fy_from, fy_to + 1):
         chunks.append((y, p_from if y == fy_from else 1, p_to if y == fy_to else 12))
     return chunks
+
+
+def _csv_safe(value: Any) -> Any:
+    """Neutralise text that Excel would run as a formula (CSV injection).
+    Amount is numeric and written as-is; this only touches SAP text cells."""
+    if isinstance(value, str) and value.startswith(_CSV_FORMULA_START):
+        return "'" + value
+    return value
 
 
 def register(mcp: FastMCP) -> None:
@@ -54,14 +61,12 @@ def register(mcp: FastMCP) -> None:
         d = get_defaults(ctx)
         fyv, warnings = None, []
         if company_code:
-            from .. import config as _cfg
-            from ..client import odata_str, validate_id
-            from ..dependencies import get_client
-            from ..governance import enforce_company_code
-            cc = enforce_company_code(ctx, company_code)
-            rows, _ = get_client(ctx).get_all(_cfg.JOURNAL_ITEM_SERVICE, "A_CompanyCode",
+            cc = enforce_company_code(ctx, validate_id(company_code, "company_code"))
+            rows, _ = get_client(ctx).get_all(config.JOURNAL_ITEM_SERVICE, "A_CompanyCode",
                                               select=["CompanyCode", "FiscalYearVariant", "Currency"],
-                                              filter_=f"CompanyCode eq {odata_str(validate_id(cc, 'company_code'))}", top=1)
+                                              filter_=f"CompanyCode eq {odata_str(cc)}", top=1)
+            if not rows:
+                warnings.append(f"Company code {cc} does not exist on this tenant; call list_company_codes.")
             fyv = rows[0].get("FiscalYearVariant") if rows else None
             if fyv and fyv != "K4":
                 warnings.append(f"Company code {cc} uses fiscal year variant {fyv}: periods are not calendar months; "
@@ -92,15 +97,18 @@ def register(mcp: FastMCP) -> None:
         controlling_area: str | None = None,
         ledger: str | None = None,
         currency: str = "company",
+        cost_center_lines_only: bool = True,
         top_n: int = 50,
     ) -> dict:
         """Totals by ANY single dimension (CostCenter, ProfitCenter, GLAccount,
-        FunctionalArea, CompanyCode, Segment, Project, WBSElement, OrderID,
-        CostCtrActivityType, PartnerCostCenter, ...) with share of total and
-        optional variance vs compare_fiscal_year. Filter with the *_s lists.
-        Example: dimension='GLAccount', cost_centers=['4120'] → what cost
-        center 4120 spends on. Example: dimension='CostCenter',
-        gl_accounts=['65000000'] → who books travel.
+        FunctionalArea, CompanyCode, Segment, BusinessArea, Plant, Project,
+        WBSElement, OrderID, CostCtrActivityType, PartnerCostCenter, ...) with
+        share of total and optional variance vs compare_fiscal_year. Filter with
+        the *_s lists. Only lines posted to a cost center count unless
+        cost_center_lines_only=false (use false for e.g. revenue by profit
+        center). Example: dimension='GLAccount', cost_centers=['17101101'] → what
+        that cost center spends on. Example: dimension='CostCenter',
+        gl_accounts=['65008430'] → who books on that account.
         """
         if dimension not in config.JOURNAL_ITEM_DIMENSIONS:
             raise S4HCError(f"dimension must be one of {config.JOURNAL_ITEM_DIMENSIONS}", "UNSUPPORTED_FIELD")
@@ -112,16 +120,19 @@ def register(mcp: FastMCP) -> None:
                 ctx, group_by=dims, currency=currency, fiscal_year=year, period_from=period_from,
                 period_to=period_to, ledger=ledger, company_code=company_code, controlling_area=controlling_area,
                 cost_centers=cost_centers, profit_centers=profit_centers, gl_accounts=gl_accounts,
-                functional_areas=functional_areas, strict=True,
+                functional_areas=functional_areas, strict=True, cost_center_lines_only=cost_center_lines_only,
             )
             return rows
 
         cur, cmp_ = pull(fy), (pull(compare_fiscal_year) if compare_fiscal_year else [])
+        currencies = ensure_single_currency(cur, cmp_, what="The two years")
         by, by_cmp = totals_by(cur, dimension), totals_by(cmp_, dimension)
-        names = {str(r.get(dimension)): r.get(NAME_FOR.get(dimension, "")) for r in cur + cmp_}
+        names = {str(r.get(dimension)): r.get(NAME_FOR.get(dimension, "")) for r in cmp_ + cur}
         grand = sum(by.values(), Decimal(0))
         items = []
-        for k, amt in sorted(by.items(), key=lambda kv: -abs(kv[1]))[: max(1, top_n)]:
+        keys = set(by) | set(by_cmp)
+        for k in sorted(keys, key=lambda k: -abs(by.get(k, Decimal(0))))[: max(1, top_n)]:
+            amt = by.get(k, Decimal(0))
             it: dict[str, Any] = {dimension: k, "name": names.get(k), "total": str(amt),
                                   "share_pct": str(round(amt / grand * 100, 1)) if grand else None}
             if compare_fiscal_year:
@@ -131,8 +142,8 @@ def register(mcp: FastMCP) -> None:
         out: dict[str, Any] = {
             **envelope(f"{config.JOURNAL_ITEM_SERVICE}/A_JournalEntryItemBasic"),
             "dimension": dimension, "fiscal_year": fy, "periods": [period_from, period_to],
-            "currency": sorted({r.get("Currency") for r in cur if r.get("Currency")}),
-            "grand_total": str(grand), "distinct_values": len(by), "shown": len(items), "items": items,
+            "currency": currencies, "cost_center_lines_only": cost_center_lines_only,
+            "grand_total": str(grand), "distinct_values": len(keys), "shown": len(items), "items": items,
         }
         if compare_fiscal_year:
             g2 = sum(by_cmp.values(), Decimal(0))
@@ -158,9 +169,9 @@ def register(mcp: FastMCP) -> None:
     ) -> dict:
         """Compare any two period ranges (Q3 vs Q2, this month vs same month
         last year, H1 2026 vs H1 2025): per cost center variance, and for each
-        cost center the G/L accounts that drive the change. Deterministic math
-        in the backend; answers "which cost centers increased the most and
-        which accounts explain it".
+        cost center the G/L accounts that drive the change. variance = base −
+        compare. Deterministic math in the backend; answers "which cost centers
+        increased the most and which accounts explain it".
         """
         def pull(y, pf, pt):
             rows, _ = fetch_actuals(
@@ -171,14 +182,15 @@ def register(mcp: FastMCP) -> None:
             return rows
 
         base, comp = pull(base_fiscal_year, base_period_from, base_period_to), pull(compare_fiscal_year, compare_period_from, compare_period_to)
-        names = {str(r["CostCenter"]): r.get("CostCenterName") for r in base + comp}
-        gl_names = {str(r["GLAccount"]): r.get("GLAccountName") for r in base + comp}
+        currencies = ensure_single_currency(base, comp, what="Base and comparison")
+        names = {str(r["CostCenter"]): r.get("CostCenterName") for r in comp + base}
+        gl_names = {str(r["GLAccount"]): r.get("GLAccountName") for r in comp + base}
 
         def by_cc_gl(rows):
             acc: dict[str, dict[str, Decimal]] = {}
             for r in rows:
-                acc.setdefault(str(r["CostCenter"]), {})
-                acc[str(r["CostCenter"])][str(r["GLAccount"])] = acc[str(r["CostCenter"])].get(str(r["GLAccount"]), Decimal(0)) + dec(r["Amount"])
+                cell = acc.setdefault(str(r["CostCenter"]), {})
+                cell[str(r["GLAccount"])] = cell.get(str(r["GLAccount"]), Decimal(0)) + dec(r["Amount"])
             return acc
 
         b, c = by_cc_gl(base), by_cc_gl(comp)
@@ -196,15 +208,12 @@ def register(mcp: FastMCP) -> None:
                           "variance": str(bt - ct), "variance_pct": pct(bt, ct), "drivers": drivers[: max(1, top_drivers)]})
         items.sort(key=lambda x: -abs(Decimal(x["variance"])))
         gb, gc = sum((Decimal(i["base_total"]) for i in items), Decimal(0)), sum((Decimal(i["compare_total"]) for i in items), Decimal(0))
-        cur_set = {r.get("Currency") for r in base + comp if r.get("Currency")}
-        if len(cur_set) > 1:
-            raise S4HCError(f"Base and comparison are in different currencies {sorted(cur_set)}", "MIXED_CURRENCY")
         # Driver contributions reconcile exactly to the total change (no residual: every G/L line is included).
         return {**envelope(f"{config.JOURNAL_ITEM_SERVICE}/A_JournalEntryItemBasic"),
                 "base": {"fiscal_year": base_fiscal_year, "periods": [base_period_from, base_period_to], "total": str(gb)},
                 "compare": {"fiscal_year": compare_fiscal_year, "periods": [compare_period_from, compare_period_to], "total": str(gc)},
                 "variance": str(gb - gc), "variance_pct": pct(gb, gc),
-                "currency": sorted({r.get("Currency") for r in base if r.get("Currency")}), "cost_centers": items}
+                "currency": currencies, "cost_centers": items}
 
     @mcp.tool()
     def cost_center_trend(
@@ -220,49 +229,59 @@ def register(mcp: FastMCP) -> None:
         ledger: str | None = None,
         currency: str = "company",
         anomaly_threshold_pct: float = 30.0,
+        anomaly_z: float = 2.0,
     ) -> dict:
         """Period-by-period series per cost center across a range that may span
-        fiscal years (e.g. 2025/007 → 2026/006 = trailing 12 months). Returns
-        month-over-month change and flags periods whose amount deviates more
-        than anomaly_threshold_pct from the cost center's average, plus a z-score.
-        Use for "what spiked", "trend", "run-rate" questions.
+        fiscal years (e.g. 2025/007 → 2026/006 = trailing 12 months). Every
+        period in the range appears, with 0 where nothing was posted, so
+        month-over-month change always compares adjacent periods. A period is
+        flagged as an anomaly when it deviates from the cost center's average by
+        at least anomaly_threshold_pct AND its z-score is at least anomaly_z
+        (needs 4+ periods). Use for "what spiked", "trend", "run-rate" questions.
         """
         fy_to = resolve_year(fiscal_year_to)
         fy_from = int(fiscal_year_from) if fiscal_year_from else fy_to
+        chunks = _year_period_range(fy_from, period_from, fy_to, period_to)
         rows: list[dict] = []
-        for y, pf, pt in _year_period_range(fy_from, period_from, fy_to, period_to):
+        for y, pf, pt in chunks:
             chunk, _ = fetch_actuals(
-                ctx, group_by=["CostCenter", "CostCenterName", "LedgerFiscalYear", "FiscalPeriod"],
+                ctx, group_by=["CostCenter", "CostCenterName", "FiscalPeriod"],
                 currency=currency, fiscal_year=y, period_from=pf, period_to=pt, ledger=ledger,
                 company_code=company_code, controlling_area=controlling_area,
                 cost_centers=cost_centers, gl_accounts=gl_accounts, strict=True,
             )
+            for r in chunk:
+                r["_year"] = y
             rows.extend(chunk)
-        if len({r.get("Currency") for r in rows if r.get("Currency")}) > 1:
-            raise S4HCError("Trend range spans several currencies; filter to one company_code or use currency='global'", "MIXED_CURRENCY")
+        currencies = ensure_single_currency(rows, what="Trend range")
 
+        all_keys = [f"{y}/{period(p)}" for y, pf, pt in chunks for p in range(pf, pt + 1)]
         series: dict[str, dict[str, Decimal]] = {}
         names: dict[str, Any] = {}
         for r in rows:
             cc = str(r.get("CostCenter"))
-            key = f"{r.get('LedgerFiscalYear')}/{r.get('FiscalPeriod')}"
+            key = f"{r['_year']}/{r.get('FiscalPeriod')}"
             series.setdefault(cc, {})
             series[cc][key] = series[cc].get(key, Decimal(0)) + dec(r["Amount"])
             names[cc] = r.get("CostCenterName")
 
+        warnings = ["Anomaly flags are descriptive (deviation from the cost center's own average), not evidence of an accounting error."]
+        if len(all_keys) < MIN_PERIODS_FOR_ANOMALY:
+            warnings.append(f"Fewer than {MIN_PERIODS_FOR_ANOMALY} periods in range: no anomaly flags.")
         out_cc = []
         for cc, s in sorted(series.items()):
-            keys = sorted(s)
-            vals = [s[k] for k in keys]
-            avg = sum(vals, Decimal(0)) / len(vals) if vals else Decimal(0)
+            vals = [s.get(k, Decimal(0)) for k in all_keys]
+            avg = sum(vals, Decimal(0)) / len(vals)
             sd = Decimal(str(statistics.pstdev([float(v) for v in vals]))) if len(vals) > 1 else Decimal(0)
             points, anomalies, prev = [], [], None
-            for k, v in zip(keys, vals):
+            for k, v in zip(all_keys, vals):
                 dev = pct(v, avg) if avg else None
-                z = str(round((v - avg) / sd, 2)) if sd else None
+                z = round((v - avg) / sd, 2) if sd else None
                 pt = {"period": k, "amount": str(v), "mom_change": str(v - prev) if prev is not None else None,
-                      "mom_change_pct": pct(v, prev) if prev is not None else None, "vs_avg_pct": dev, "z": z}
-                if dev is not None and abs(float(dev)) >= anomaly_threshold_pct:
+                      "mom_change_pct": pct(v, prev) if prev is not None else None, "vs_avg_pct": dev,
+                      "z": str(z) if z is not None else None}
+                if (len(vals) >= MIN_PERIODS_FOR_ANOMALY and dev is not None and z is not None
+                        and abs(float(dev)) >= anomaly_threshold_pct and abs(float(z)) >= anomaly_z):
                     pt["anomaly"] = True
                     anomalies.append(k)
                 points.append(pt)
@@ -270,11 +289,10 @@ def register(mcp: FastMCP) -> None:
             out_cc.append({"cost_center": cc, "name": names.get(cc), "total": str(sum(vals, Decimal(0))),
                            "average_per_period": str(round(avg, 2)), "periods": len(vals),
                            "anomalous_periods": anomalies, "series": points})
-        return {**envelope(f"{config.JOURNAL_ITEM_SERVICE}/A_JournalEntryItemBasic", warnings=[
-                    "Anomaly flags are descriptive (deviation from the cost center's own average), not evidence of an accounting error."]),
-                "range": {"from": f"{fy_from}/{period_from:03d}", "to": f"{fy_to}/{period_to:03d}"},
-                "currency": sorted({r.get("Currency") for r in rows if r.get("Currency")}),
-                "anomaly_threshold_pct": anomaly_threshold_pct, "cost_centers": out_cc}
+        return {**envelope(f"{config.JOURNAL_ITEM_SERVICE}/A_JournalEntryItemBasic", warnings=warnings),
+                "range": {"from": f"{fy_from}/{period(period_from)}", "to": f"{fy_to}/{period(period_to)}"},
+                "currency": currencies, "anomaly_threshold_pct": anomaly_threshold_pct, "anomaly_z": anomaly_z,
+                "cost_centers": out_cc}
 
     @mcp.tool()
     def export_actuals_csv(
@@ -290,25 +308,29 @@ def register(mcp: FastMCP) -> None:
         controlling_area: str | None = None,
         ledger: str | None = None,
         currency: str = "company",
-        top: int = 20000,
+        cost_center_lines_only: bool = True,
+        top: int = 5000,
     ) -> dict:
         """Same data as get_cost_center_actuals but returned as CSV text
         (header + rows) for the agent to hand back as a file or paste into Excel.
+        Text cells that would start an Excel formula are prefixed with an
+        apostrophe. top is capped at S4HC_MAX_INLINE_ROWS (default 5000).
+        Returns {row_count, truncated, columns, filename, csv}.
         """
         fy = resolve_year(fiscal_year)
         dims = group_by or DEFAULT_DIMS
         rows, truncated = fetch_actuals(
             ctx, group_by=dims, currency=currency, fiscal_year=fy, period_from=period_from,
             period_to=period_to, ledger=ledger, company_code=company_code, controlling_area=controlling_area,
-            top=max(1, min(top, config.get_max_rows())), cost_centers=cost_centers, gl_accounts=gl_accounts,
-            profit_centers=profit_centers,
+            top=inline_top(top), cost_center_lines_only=cost_center_lines_only, cost_centers=cost_centers,
+            gl_accounts=gl_accounts, profit_centers=profit_centers,
         )
         cols = [c for c in dims if c in config.JOURNAL_ITEM_DIMENSIONS] + ["Amount", "Currency"]
         buf = io.StringIO()
         w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         for r in rows:
-            w.writerow(r)
+            w.writerow({k: (v if k == "Amount" else _csv_safe(v)) for k, v in r.items()})
         return {**envelope(f"{config.JOURNAL_ITEM_SERVICE}/A_JournalEntryItemBasic", truncated=truncated),
-                "rows": len(rows), "truncated": truncated, "columns": cols,
-                "filename": f"cost_center_actuals_{fy}_{period_from:03d}-{period_to:03d}.csv", "csv": buf.getvalue()}
+                "row_count": len(rows), "truncated": truncated, "columns": cols,
+                "filename": f"cost_center_actuals_{fy}_{period(period_from)}-{period(period_to)}.csv", "csv": buf.getvalue()}
