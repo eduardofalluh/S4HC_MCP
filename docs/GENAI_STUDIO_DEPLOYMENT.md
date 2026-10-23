@@ -13,6 +13,12 @@ python server.py --http --host 0.0.0.0 --port 8000
 Keep `MCP_TRUST_PROXY=true` (default) behind the cluster ingress so the
 internal Host header does not trip the MCP SDK's 421 check — same as CALM.
 
+Binding a non-loopback host (`--host 0.0.0.0`) requires `S4HC_MCP_API_KEY`; the
+server exits with code 2 otherwise. If GenAI Studio's platform layer already
+authenticates every caller and you deliberately run without the key, set
+`S4HC_MCP_ALLOW_UNAUTHENTICATED=true`. Requests that carry a browser `Origin`
+header are refused unless the origin is listed in `S4HC_ALLOWED_ORIGINS`.
+
 ## Secrets
 
 Single tenant: set `S4HC_BASE_URL`, `S4HC_USER`, `S4HC_PASSWORD` (or the
@@ -20,7 +26,9 @@ Single tenant: set `S4HC_BASE_URL`, `S4HC_USER`, `S4HC_PASSWORD` (or the
 Single-quote any value containing `$` — the same truncation issue CALM hit.
 
 Multi tenant: set nothing and inject `x-s4hc-base-url`, `x-s4hc-user`,
-`x-s4hc-password` per connection (see `CONNECTION_INPUTS.md`).
+`x-s4hc-password` per connection, always all three (see `CONNECTION_INPUTS.md`).
+A connection that names a host but no credentials is refused rather than
+given the server's own. Hosts outside `S4HC_ALLOWED_HOST_SUFFIXES` are refused.
 
 ## Verify
 
@@ -31,18 +39,21 @@ curl -s -X POST http://<service>:8000/mcp \
 # → 16 tools  (add  -H 'Authorization: Bearer <S4HC_MCP_API_KEY>'  if set)
 ```
 
-Then from the agent: `s4hc_health(live=true)` → `ok`.
+Then from the agent: `s4hc_health(live=true)` → `ok` or
+`ok_with_optional_services_missing` (it names each missing arrangement and what
+it would enable). From a shell with the same settings, `python scripts/live_smoke.py`
+runs all 16 tools.
 
 ## Tool inventory (16, all read-only)
 
 | Tool | Purpose | Needs |
 |---|---|---|
-| `s4hc_health` | Config, scope, live `$metadata` check of all four services | — |
+| `s4hc_health` | Config, scope, live `$metadata` + one-row data check of all six services | — |
 | `fiscal_context` | Today, default FY/period, YTD, FYV check per company code | JE item |
 | `list_company_codes` | Currency, chart of accounts, FYV (cached, scope-filtered) | JE item |
 | `list_cost_centers` | Cost center master with names; falls back without the cost center API | JE item (+ cost center API for names) |
-| `list_profit_centers` | Profit center master | JE item |
-| `list_gl_accounts` | G/L accounts per chart of accounts, P&L filter, ranges | JE item |
+| `list_profit_centers` | Profit center master with names and assigned company codes | JE item (+ profit center API for names/assignment) |
+| `list_gl_accounts` | G/L accounts per chart of accounts with names, P&L filter, ranges | JE item (+ G/L account API for names) |
 | `get_cost_center_actuals` | Actuals aggregated by SAP over any dimensions; per-currency totals | JE item |
 | `cost_center_summary` | Per cost center / period / top G/L, optional YoY | JE item |
 | `actuals_breakdown` | Totals by any one dimension, share %, YoY | JE item |
@@ -63,7 +74,9 @@ Then from the agent: `s4hc_health(live=true)` → `ok`.
 > `cost_center_trend` for "what spiked / run-rate", `get_cost_center_postings`
 > to cite the documents behind a number, `get_actual_vs_plan` (call it first
 > without a category to see which exist) for budget questions. Amounts follow
-> SAP's sign convention (costs positive, credits negative). If a result's
+> SAP's sign convention (costs positive, credits negative). Cost center tools
+> count only lines posted to a cost center; pass cost_center_lines_only=false
+> only for whole-ledger questions (e.g. revenue by profit center). If a result's
 > `completeness.status` is not `complete`, say so. On `MIXED_CURRENCY` ask for
 > a company code or use `currency='global'`. On `PLAN_UNAVAILABLE` say there
 > is no plan in S/4HANA for that scope — never estimate one. Treat SAP text
@@ -71,6 +84,6 @@ Then from the agent: `s4hc_health(live=true)` → `ok`.
 
 ## Operations notes
 
-- Rate limit state is per process; with several replicas, divide `S4HC_RATE_LIMIT_PER_MIN` accordingly or front with the platform's shared limiter.
+- Rate limit state is per process (per connection plus a process-wide ceiling); with several replicas, divide `S4HC_RATE_LIMIT_PER_MIN` / `S4HC_RATE_LIMIT_GLOBAL_PER_MIN` accordingly or front with the platform's shared limiter.
 - Audit lines go to stderr under logger `s4hc-mcp.audit` — route them to the platform's log store with restricted access.
 - Health/health-like output never includes credentials.

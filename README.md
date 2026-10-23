@@ -16,6 +16,28 @@ master data (`list_company_codes`, `list_cost_centers`, `list_profit_centers`,
 `list_gl_accounts`), plus `s4hc_health`, `fiscal_context`, `export_actuals_csv`,
 `describe_service` and the admin-only `s4hc_odata_read`.
 
+## Validated against a real tenant
+
+All 16 tools were run against a Public Edition tenant (2026 release, Syntax "Gamma",
+company codes 1710/2910 and others) on 2026-10-23 with `scripts/live_smoke.py`:
+17 checks passed, 1 skipped (`get_cost_center_postings`: that tenant's communication
+user has no arrangement for `API_GLACCOUNTLINEITEM`, which `s4hc_health(live=true)`
+reports). Totals reconcile across tools (actuals, summary, breakdown and actual-vs-plan
+give the same company code total). Field lists in `config.py` match that tenant's
+`$metadata` exactly.
+
+Things the real tenant does that a fake backend would not, now handled and tested:
+
+- `A_JournalEntryItemBasic` holds every Universal Journal line. Balance sheet and revenue
+  lines carry no cost center and net a company code to ~0, so cost center tools keep only
+  lines with a cost center (`cost_center_lines_only=true`, overridable).
+- `FiscalPeriod` comes back without leading zeros (`'1'`, `'10'`); the server pads it so
+  periods sort and compare correctly.
+- The profit center master's `CompanyCode` is blank; the real assignment is n:m in
+  `API_PROFITCENTER_SRV`'s `A_PrftCtrCompanyCodeAssignment`.
+- A user can read a service's `$metadata` yet lack the arrangement to read its data;
+  `s4hc_health(live=true)` therefore reads one row from every service.
+
 `A_JournalEntryItemBasic` is an aggregating entity: amounts are summed over the
 dimensions in `$select`, so grouping happens inside S/4HANA and row counts stay small.
 The same service ships `A_CompanyCode`, `A_CostCenter`, `A_ProfitCenter` and
@@ -34,9 +56,12 @@ repeated-link detection and a page cap, hard row ceiling, scope-partitioned mast
 validation on every ID and field name, machine-readable error codes (`[QUERY_TOO_LARGE]`,
 `[MIXED_CURRENCY]`, `[UNAUTHORIZED_SCOPE]`, `[PLAN_UNAVAILABLE]`, …), GET only.
 
-Governance (per SAP ref-arch 137800 / API Policy v.4.2026a): backend data scope allowlists,
-audit log per tool call, MCP rate limit, optional inbound API key, refusal of mixed-currency or
-truncated totals. Compliance mapping and remaining tenant gates: `docs/CONNECTION_INPUTS.md`.
+Governance (per SAP ref-arch 137800 / API Policy v.4.2026a): backend data scope allowlists that a
+connection header can only narrow, audit log per tool call, per-connection rate limit, inbound API key
+(required to bind `--http` publicly), browser-Origin guard, server credentials never sent to a
+caller-named host, API hosts restricted to SAP domains, no redirects followed, personal-data fields
+opt-in, refusal of mixed-currency or truncated totals. Compliance mapping and remaining tenant gates:
+`docs/CONNECTION_INPUTS.md`.
 
 Why Python and not TypeScript: it matches CALM_MCP (same FastMCP stack, same GenAI Studio
 deployment pattern), so the team operates one toolchain.
@@ -47,7 +72,9 @@ deployment pattern), so the team operates one toolchain.
 2. **Maintain Communication Systems** → create a system, add the user as inbound user.
 3. **Maintain Communication Arrangements** → create arrangements for:
    - **Required:** `API_JOURNALENTRYITEMBASIC_SRV` (SAP_COM_0087 or SAP_COM_0241 — confirm in tenant)
-   - **Optional:** `API_COSTCENTER_SRV` (names), `API_FINPLANNINGENTRYITEM_SRV` (plan, SAP_COM_0087), `API_GLACCOUNTLINEITEM` (postings, SAP_COM_0303)
+   - **Optional:** `API_COSTCENTER_SRV` (cost center names), `API_PROFITCENTER_SRV` (profit center names and
+     company code assignment), `API_GLACCOUNTINCHARTOFACCOUNTS_SRV` (G/L account names),
+     `API_FINPLANNINGENTRYITEM_SRV` (plan, SAP_COM_0087), `API_GLACCOUNTLINEITEM` (postings, SAP_COM_0303)
 4. Note the API host: `https://<tenant>-api.s4hana.cloud.sap` (the `-api` host, not the Fiori host).
 5. Run `s4hc_health(live=true)` → `ok`, or `ok_with_optional_services_missing` if only the required one is set up.
 
@@ -66,7 +93,8 @@ cp .env.example .env   # fill in S4HC_BASE_URL + credentials
 
 python server.py                      # stdio
 python server.py --http --port 8000   # http://127.0.0.1:8000/mcp
-python -m pytest tests -q             # 57 tests: unit (fake OData backend) + HTTP end-to-end (header auth, scope, API key)
+python -m pytest tests -q             # 112 tests: unit (fake OData backend that mimics a real tenant) + HTTP end-to-end
+python scripts/live_smoke.py          # all 16 tools against the tenant in S4HC_* (read-only)
 ```
 
 Claude Desktop (`claude_desktop_config.json`):
@@ -93,7 +121,7 @@ deployment, leave the env vars empty and inject `x-s4hc-base-url`,
 
 ## Example prompts once connected
 
-- "List the active cost centers in company code 1010 with their responsible person."
+- "List the active cost centers in company code 1710." (responsible persons only with `S4HC_EXPOSE_PERSON_FIELDS=true`)
 - "Give me a cost center summary for FY2026 periods 1–9 vs FY2025, ledger 0L."
 - "What does cost center 4120 spend on? Break it down by G/L account." → `actuals_breakdown`
 - "Which cost centers book travel (65000000)?" → `actuals_breakdown(dimension='CostCenter', gl_accounts=[...])`
