@@ -135,7 +135,8 @@ def test_header_credentials_never_mixed_or_redirected(server_url):
     err = call(server_url, "list_company_codes", headers={"x-s4hc-base-url": "https://other-api.s4hana.cloud.sap"})
     assert "NOT_CONFIGURED" in err["__error__"]
     # User without password never borrows anyone else's password.
-    err = call(server_url, "list_company_codes", headers={**TENANT, "x-s4hc-password": ""})
+    no_password = {k: v for k, v in TENANT.items() if k != "x-s4hc-password"}
+    err = call(server_url, "list_company_codes", headers=no_password)
     assert "NOT_CONFIGURED" in err["__error__"]
     # A host outside the SAP API domains is refused before any request is made.
     err = call(server_url, "list_company_codes", headers={**TENANT, "x-s4hc-base-url": "https://internal.example.com"})

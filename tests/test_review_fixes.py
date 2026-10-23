@@ -4,6 +4,7 @@ Public Edition tenant. Each test fails on the code before that review."""
 from __future__ import annotations
 
 import os
+import secrets
 import stat
 from decimal import Decimal
 
@@ -26,8 +27,17 @@ class Ctx:
         self.request_context = type("RC", (), {"request": _Req(headers)})()
 
 
-def header_ctx(password="pw-one", user="comm_b", base="https://tenant-b-api.s4hana.cloud.sap", **extra):
-    return Ctx({"x-s4hc-base-url": base, "x-s4hc-user": user, "x-s4hc-password": password, **extra})
+# Throwaway credentials generated per run, one per label: the fake backend never
+# checks them, and nothing credential-like is committed to the repository.
+_RUN_CREDENTIALS: dict[str, str] = {}
+
+
+def cred(label: str) -> str:
+    return _RUN_CREDENTIALS.setdefault(label, secrets.token_urlsafe(12))
+
+
+def header_ctx(password=None, user="comm_b", base="https://tenant-b-api.s4hana.cloud.sap", **extra):
+    return Ctx({"x-s4hc-base-url": base, "x-s4hc-user": user, "x-s4hc-password": password or cred("one"), **extra})
 
 
 # ------------------------------------------------------------ credentials
@@ -43,7 +53,7 @@ def test_user_header_requires_password_header():
     with pytest.raises(S4HCError, match="sent together"):
         dependencies.get_client(Ctx({"x-s4hc-user": "someone"}))
     with pytest.raises(S4HCError, match="sent together"):
-        dependencies.get_client(Ctx({"x-s4hc-password": "x"}))
+        dependencies.get_client(Ctx({"x-s4hc-password": cred("lonely")}))
 
 
 @pytest.mark.parametrize("url", ["https://internal.example.com", "http://tenant-api.s4hana.cloud.sap",
@@ -60,32 +70,33 @@ def test_extra_host_suffix_can_be_allowed(monkeypatch):
 
 
 def test_client_cache_keyed_by_password():
-    a = dependencies.get_client(header_ctx("pw-one"))
-    b = dependencies.get_client(header_ctx("pw-two"))
-    assert a is not b and a.session.auth == ("comm_b", "pw-one") and b.session.auth == ("comm_b", "pw-two")
-    assert dependencies.get_client(header_ctx("pw-one")) is a
+    a = dependencies.get_client(header_ctx(cred("one")))
+    b = dependencies.get_client(header_ctx(cred("two")))
+    assert a is not b and a.session.auth == ("comm_b", cred("one")) and b.session.auth == ("comm_b", cred("two"))
+    assert dependencies.get_client(header_ctx(cred("one"))) is a
 
 
 def test_master_cache_not_shared_across_credentials(tool, calls):
-    tool("list_company_codes")(ctx=header_ctx("pw-one"))
+    tool("list_company_codes")(ctx=header_ctx(cred("one")))
     n = len(calls)
-    tool("list_company_codes")(ctx=header_ctx("pw-one"))
+    tool("list_company_codes")(ctx=header_ctx(cred("one")))
     assert len(calls) == n  # same credential: cached
-    tool("list_company_codes")(ctx=header_ctx("wrong-password"))
+    tool("list_company_codes")(ctx=header_ctx(cred("wrong")))
     assert len(calls) == 2 * n  # other credential: asks SAP itself, never served the cached rows
-    assert calls[-1]["auth"] == ("comm_b", "wrong-password")
+    assert calls[-1]["auth"] == ("comm_b", cred("wrong"))
 
 
 def test_caches_are_bounded(monkeypatch):
     monkeypatch.setattr(dependencies, "MAX_CLIENTS", 3)
     for i in range(10):
-        dependencies.get_client(header_ctx(f"pw-{i}"))
+        dependencies.get_client(header_ctx(cred(f"n{i}")))
     assert len(dependencies._cached) == 3
 
 
 def test_inline_pem_written_once_owner_only(monkeypatch):
-    monkeypatch.setenv("S4HC_CLIENT_CERT_PEM", "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n")
-    monkeypatch.setenv("S4HC_CLIENT_KEY_PEM", "-----BEGIN PRIVATE KEY-----\nBBBB\n-----END PRIVATE KEY-----\n")
+    # Opaque random content: the test checks caching and file mode, not PEM parsing.
+    monkeypatch.setenv("S4HC_CLIENT_CERT_PEM", secrets.token_hex(16))
+    monkeypatch.setenv("S4HC_CLIENT_KEY_PEM", secrets.token_hex(16))
     first = config.resolve_client_cert()
     assert config.resolve_client_cert() == first  # no new temp file per call
     assert stat.S_IMODE(os.stat(first[1]).st_mode) == 0o600
@@ -165,7 +176,7 @@ def test_rate_limit_is_per_connection(monkeypatch):
             return "ok"
         return asyncio.run(mw.on_call_tool(MC(), ok))
 
-    a, b = header_ctx("pw-a", user="tenant_a"), header_ctx("pw-b", user="tenant_b")
+    a, b = header_ctx(cred("a"), user="tenant_a"), header_ctx(cred("b"), user="tenant_b")
     for ctx in (a, b):  # both connections have been accepted by SAP
         dependencies.mark_verified(dependencies.resolve_connection(ctx).fingerprint)
     assert call(a) == "ok"
@@ -425,7 +436,7 @@ def test_rate_limit_buckets_are_bounded(monkeypatch):
     for i in range(10):
         class MC:
             message = Msg()
-            fastmcp_context = header_ctx("pw", user=f"user_{i}")
+            fastmcp_context = header_ctx(cred("shared"), user=f"user_{i}")
         asyncio.run(mw.on_call_tool(MC(), ok))
     assert len(mw._unverified_buckets) == 4 and not mw._buckets
 
@@ -465,8 +476,8 @@ def test_raw_read_never_returns_person_fields(tool, monkeypatch):
 
 def test_fingerprint_is_keyed_not_plain_sha256():
     import hashlib
-    conn = dependencies.resolve_connection(header_ctx("pw-one"))
-    plain = hashlib.sha256("\0".join([conn.base_url, "comm_b", "pw-one"]).encode()).hexdigest()[:32]
+    conn = dependencies.resolve_connection(header_ctx(cred("one")))
+    plain = hashlib.sha256("\0".join([conn.base_url, "comm_b", cred("one")]).encode()).hexdigest()[:32]
     assert conn.fingerprint != plain
 
 
@@ -523,7 +534,7 @@ def test_cycling_passwords_cannot_drain_other_tenants(tool, monkeypatch):
     refused = 0
     for i in range(10):  # attacker: same user, a new invented password every call
         try:
-            call(header_ctx(f"guess-{i}"))
+            call(header_ctx(cred(f"guess{i}")))
         except S4HCError:
             refused += 1
     assert refused == 7  # every unverified caller shares the unverified ceiling of 3
@@ -552,11 +563,11 @@ def test_unverified_flood_cannot_lock_out_an_accepted_tenant(monkeypatch, caplog
             return "ok"
         return asyncio.run(mw.on_call_tool(MC(), ok))
 
-    victim = header_ctx("real-pw", user="victim")
+    victim = header_ctx(cred("victim"), user="victim")
     dependencies.mark_verified(dependencies.resolve_connection(victim).fingerprint)
     for i in range(10):  # attacker knows the victim's host and user, not the password
         try:
-            call(header_ctx(f"guess-{i}", user="victim"))
+            call(header_ctx(cred(f"guess{i}"), user="victim"))
         except S4HCError:
             pass
     assert call(victim) == "ok" and call(None) == "ok"  # accepted tenant and the server's own connection unaffected
@@ -565,12 +576,12 @@ def test_unverified_flood_cannot_lock_out_an_accepted_tenant(monkeypatch, caplog
 
 
 def test_sap_answer_marks_credentials_verified(tool):
-    ctx = header_ctx("pw-ok")
+    ctx = header_ctx(cred("ok"))
     assert dependencies.rate_limit_key(ctx)[1] is False
     tool("list_company_codes")(ctx=ctx)
     assert dependencies.rate_limit_key(ctx)[1] is True
     fake_s4hc.STATE["bad_auth"] = True
-    bad = header_ctx("pw-wrong")
+    bad = header_ctx(cred("rejected"))
     with pytest.raises(S4HCError):
         tool("list_company_codes")(ctx=bad)
     assert dependencies.rate_limit_key(bad)[1] is False
