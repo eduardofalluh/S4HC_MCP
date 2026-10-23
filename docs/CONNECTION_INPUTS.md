@@ -38,7 +38,9 @@ Studio) is recorded as the caller in the audit log.
 | `S4HC_JOURNAL_ITEM_SERVICE`, `S4HC_COSTCENTER_SERVICE`, `S4HC_PROFITCENTER_SERVICE`, `S4HC_GLACCOUNT_SERVICE`, `S4HC_GLLINEITEM_SERVICE`, `S4HC_PLAN_SERVICE` | SAP standard paths | Override with the inbound path shown in the tenant's Communication Arrangement if it differs. Never guess by appending `_SRV`. |
 
 Server-side knobs that are **not** per-connection inputs: `S4HC_RATE_LIMIT_PER_MIN`
-(120, per connection), `S4HC_RATE_LIMIT_GLOBAL_PER_MIN` (600), `S4HC_PAGE_SIZE` (1000), `S4HC_MAX_ROWS`
+(120, per connection), `S4HC_RATE_LIMIT_GLOBAL_PER_MIN` (600, shared by trusted connections: the server's
+own credentials and any credential SAP has answered 2xx for), `S4HC_RATE_LIMIT_UNVERIFIED_PER_MIN` (60, shared
+by all credentials SAP has not accepted yet, so invented ones cannot crowd out real tenants), `S4HC_PAGE_SIZE` (1000), `S4HC_MAX_ROWS`
 (50000), `S4HC_MAX_INLINE_ROWS` (5000 raw rows per response), `S4HC_MAX_PAGES` (100),
 `S4HC_REQUEST_DEADLINE_SECONDS` (120, one paged read including retries), `S4HC_MASTER_CACHE_TTL` (600 s),
 `S4HC_MAX_CACHED_CONNECTIONS` (64), `S4HC_MAX_CACHED_RESULTS` (512), `MCP_HOST`, `MCP_PORT`,
@@ -80,7 +82,7 @@ or custom MCP server provided its conditions are met. How this server meets them
 | API Policy adhered to, incl. General API Controls (§2.1) | Published APIs only, used for their documented purpose (reporting reads); paging with a hard row ceiling; no bulk replication — aggregation is pushed to SAP. |
 | Authentication on every connection | Communication user (Basic or X.509) per tenant; no anonymous path. Per-connection headers mean no shared credential across tenants; header and server credentials are never mixed, and cached clients/results are keyed on a credential fingerprint. |
 | Never store long-lived credentials in the server | Credentials come from the platform secret store (env) or per-request headers; nothing on disk, nothing logged. |
-| Rate limits of the underlying API respected | `S4HC_RATE_LIMIT_PER_MIN` at the MCP layer; client honours `Retry-After` on 429/503 with backoff. |
+| Rate limits of the underlying API respected | Per-connection and global limits at the MCP layer (unverified credentials capped separately); client honours `Retry-After` on 429/503 with backoff; response bodies streamed with a 64 MB cap. |
 | Input validation, TLS 1.2+ | Every ID / field name validated against an allowlist; https enforced on the base URL, which must be a plain origin on an SAP API domain; redirects are never followed. |
 | Authorization enforced | Backend data scope (allowed company codes / cost centers) — the agent cannot widen it. |
 | Monitoring | Audit log per tool call: tool, caller, scope args, duration, outcome. |

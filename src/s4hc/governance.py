@@ -171,29 +171,35 @@ class _TokenBucket:
 
 
 class AuditAndRateLimitMiddleware(Middleware):
-    """Logs every tool call and enforces S4HC_RATE_LIMIT_PER_MIN (default 120)
-    per connection and S4HC_RATE_LIMIT_GLOBAL_PER_MIN (default 600) across the
-    connections SAP has accepted, so one busy or looping connection cannot lock
-    every other tenant out. Credentials SAP has not accepted yet share one
-    bucket per host + user and never draw on the global budget."""
+    """Logs every tool call and rate-limits it.
+
+    Trusted connections (the server's own env credentials, or credentials SAP has
+    answered 2xx for) get S4HC_RATE_LIMIT_PER_MIN (120) each and share
+    S4HC_RATE_LIMIT_GLOBAL_PER_MIN (600). Unverified connections get the same
+    per-connection limit but all share S4HC_RATE_LIMIT_UNVERIFIED_PER_MIN (60),
+    in a separate bounded map: invented credentials can neither drain the
+    trusted budget nor evict a trusted connection's bucket."""
 
     MAX_BUCKETS = 1024
 
     def __init__(self) -> None:
         self.per_connection = int(os.getenv("S4HC_RATE_LIMIT_PER_MIN", "120"))
         self.global_bucket = _TokenBucket(int(os.getenv("S4HC_RATE_LIMIT_GLOBAL_PER_MIN", "600")))
+        self.unverified_bucket = _TokenBucket(int(os.getenv("S4HC_RATE_LIMIT_UNVERIFIED_PER_MIN", "60")))
         self._buckets: OrderedDict[str, _TokenBucket] = OrderedDict()
+        self._unverified_buckets: OrderedDict[str, _TokenBucket] = OrderedDict()
         self._lock = threading.Lock()
 
-    def _bucket(self, key: str) -> _TokenBucket:
+    def _bucket(self, key: str, buckets: OrderedDict[str, _TokenBucket] | None = None) -> _TokenBucket:
+        buckets = self._buckets if buckets is None else buckets
         with self._lock:
-            b = self._buckets.get(key)
+            b = buckets.get(key)
             if b is None:
-                b = self._buckets[key] = _TokenBucket(self.per_connection)
-                while len(self._buckets) > self.MAX_BUCKETS:
-                    self._buckets.popitem(last=False)
+                b = buckets[key] = _TokenBucket(self.per_connection)
+                while len(buckets) > self.MAX_BUCKETS:
+                    buckets.popitem(last=False)
             else:
-                self._buckets.move_to_end(key)
+                buckets.move_to_end(key)
             return b
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):
@@ -209,19 +215,22 @@ class AuditAndRateLimitMiddleware(Middleware):
             caller = req.headers.get("x-user-email") or req.headers.get("x-s4hc-user")
         except Exception:  # noqa: BLE001
             pass
-        conn, verified = rate_limit_key(ctx)
-        # Only connections SAP has accepted draw on the process-wide budget, so a
-        # caller inventing credentials cannot exhaust it for every other tenant.
-        if not self._bucket(conn).allow() or (verified and not self.global_bucket.allow()):
-            log.warning("audit tool=%s caller=%s conn=%s outcome=rate_limited", name, caller, conn[:8])
+        conn, trusted = rate_limit_key(ctx)
+        if trusted:
+            allowed = self._bucket(conn).allow() and self.global_bucket.allow()
+        else:
+            allowed = self.unverified_bucket.allow() and self._bucket(conn, self._unverified_buckets).allow()
+        tag = f"conn={conn[:8]} trusted={trusted}"
+        if not allowed:
+            log.warning("audit tool=%s caller=%s %s outcome=rate_limited", name, caller, tag)
             raise S4HCError("Rate limit exceeded for this connection; retry in a minute", "SAP_RATE_LIMITED")
         t0 = time.monotonic()
         try:
             result = await call_next(context)
         except Exception as exc:
-            log.info("audit tool=%s caller=%s conn=%s args=%s ms=%d outcome=error:%s",
-                     name, caller, conn[:8], scope_args, (time.monotonic() - t0) * 1000, exc.__class__.__name__)
+            log.info("audit tool=%s caller=%s %s args=%s ms=%d outcome=error:%s",
+                     name, caller, tag, scope_args, (time.monotonic() - t0) * 1000, exc.__class__.__name__)
             raise
-        log.info("audit tool=%s caller=%s conn=%s args=%s ms=%d outcome=ok",
-                 name, caller, conn[:8], scope_args, (time.monotonic() - t0) * 1000)
+        log.info("audit tool=%s caller=%s %s args=%s ms=%d outcome=ok",
+                 name, caller, tag, scope_args, (time.monotonic() - t0) * 1000)
         return result

@@ -35,8 +35,11 @@ MASTER_TTL_SECONDS = int(os.getenv("S4HC_MASTER_CACHE_TTL", "600"))
 MAX_CLIENTS = int(os.getenv("S4HC_MAX_CACHED_CONNECTIONS", "64"))
 MAX_MASTER_ENTRIES = int(os.getenv("S4HC_MAX_CACHED_RESULTS", "512"))
 
+MAX_VERIFIED = 4096
+
 _cached: OrderedDict[str, S4HCClient] = OrderedDict()
 _master_cache: OrderedDict[str, tuple[float, Any]] = OrderedDict()
+_verified: OrderedDict[str, None] = OrderedDict()  # fingerprints SAP has answered 2xx for
 _lock = threading.Lock()
 
 HEADER_PREFIX = "x-s4hc-"
@@ -121,7 +124,8 @@ def get_client(ctx: Context | None = None) -> S4HCClient:
         if client is not None:
             _cached.move_to_end(key)
             return client
-    client = S4HCClient(conn.base_url, user=conn.user, password=conn.password, cert=conn.cert)
+    client = S4HCClient(conn.base_url, user=conn.user, password=conn.password, cert=conn.cert,
+                        on_verified=lambda: mark_verified(key))
     with _lock:
         _cached[key] = client
         while len(_cached) > MAX_CLIENTS:
@@ -136,20 +140,27 @@ def connection_fingerprint(ctx: Context | None = None) -> str:
         return "unresolved"
 
 
+def mark_verified(fingerprint: str) -> None:
+    """Only a 2xx from SAP calls this, so the set holds credentials SAP accepted."""
+    with _lock:
+        _verified[fingerprint] = None
+        _verified.move_to_end(fingerprint)
+        while len(_verified) > MAX_VERIFIED:
+            _verified.popitem(last=False)
+
+
 def rate_limit_key(ctx: Context | None = None) -> tuple[str, bool]:
-    """(bucket key, verified). A connection SAP has already accepted is keyed by
-    its credential fingerprint; one that has not is keyed by host + user only,
-    so cycling invented passwords cannot mint fresh buckets."""
+    """(connection fingerprint, trusted). The server's own env connection and any
+    credential SAP has already accepted are trusted; everything else is an
+    unverified caller, limited separately so it cannot crowd out trusted ones."""
     try:
         conn = resolve_connection(ctx)
     except S4HCError:
         return "unresolved", False
-    with _lock:
-        client = _cached.get(conn.fingerprint)
-    if client is not None and client.verified:
+    if conn.source == "env":
         return conn.fingerprint, True
-    return "unverified|" + hmac.new(_FINGERPRINT_KEY, f"{conn.base_url}\0{conn.user or ''}".encode(),
-                                    hashlib.sha256).hexdigest()[:32], False
+    with _lock:
+        return conn.fingerprint, conn.fingerprint in _verified
 
 
 def cached(ctx: Context | None, key: str, loader: Callable[[], Any]) -> Any:

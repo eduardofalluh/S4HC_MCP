@@ -84,6 +84,6 @@ runs all 16 tools.
 
 ## Operations notes
 
-- Rate limit state is per process (per connection plus a process-wide ceiling); with several replicas, divide `S4HC_RATE_LIMIT_PER_MIN` / `S4HC_RATE_LIMIT_GLOBAL_PER_MIN` accordingly or front with the platform's shared limiter.
+- Rate limit state is per process (per connection plus a process-wide ceiling); with several replicas, divide `S4HC_RATE_LIMIT_PER_MIN` / `S4HC_RATE_LIMIT_GLOBAL_PER_MIN` / `S4HC_RATE_LIMIT_UNVERIFIED_PER_MIN` accordingly or front with the platform's shared limiter.
 - Audit lines go to stderr under logger `s4hc-mcp.audit` — route them to the platform's log store with restricted access.
 - Health/health-like output never includes credentials.

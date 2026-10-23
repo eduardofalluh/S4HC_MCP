@@ -167,7 +167,7 @@ def test_rate_limit_is_per_connection(monkeypatch):
 
     a, b = header_ctx("pw-a", user="tenant_a"), header_ctx("pw-b", user="tenant_b")
     for ctx in (a, b):  # both connections have been accepted by SAP
-        dependencies.get_client(ctx).verified = True
+        dependencies.mark_verified(dependencies.resolve_connection(ctx).fingerprint)
     assert call(a) == "ok"
     with pytest.raises(S4HCError, match="Rate limit"):
         call(a)
@@ -427,7 +427,7 @@ def test_rate_limit_buckets_are_bounded(monkeypatch):
             message = Msg()
             fastmcp_context = header_ctx("pw", user=f"user_{i}")
         asyncio.run(mw.on_call_tool(MC(), ok))
-    assert len(mw._buckets) == 4
+    assert len(mw._unverified_buckets) == 4 and not mw._buckets
 
 
 def test_profit_centers_cap_after_company_filter(tool):
@@ -504,6 +504,7 @@ def test_cycling_passwords_cannot_drain_other_tenants(tool, monkeypatch):
     from src.s4hc.governance import AuditAndRateLimitMiddleware
     monkeypatch.setenv("S4HC_RATE_LIMIT_PER_MIN", "3")
     monkeypatch.setenv("S4HC_RATE_LIMIT_GLOBAL_PER_MIN", "3")
+    monkeypatch.setenv("S4HC_RATE_LIMIT_UNVERIFIED_PER_MIN", "3")
     mw = AuditAndRateLimitMiddleware()
 
     class Msg:
@@ -525,5 +526,63 @@ def test_cycling_passwords_cannot_drain_other_tenants(tool, monkeypatch):
             call(header_ctx(f"guess-{i}"))
         except S4HCError:
             refused += 1
-    assert refused == 7  # they share one unverified bucket of 3
+    assert refused == 7  # every unverified caller shares the unverified ceiling of 3
     assert call(None) == "ok"  # the verified tenant still has its global budget
+
+
+def test_unverified_flood_cannot_lock_out_an_accepted_tenant(monkeypatch, caplog):
+    import asyncio
+    import logging
+
+    from src.s4hc.governance import AuditAndRateLimitMiddleware
+    monkeypatch.setenv("S4HC_RATE_LIMIT_PER_MIN", "2")
+    monkeypatch.setenv("S4HC_RATE_LIMIT_UNVERIFIED_PER_MIN", "2")
+    mw = AuditAndRateLimitMiddleware()
+    caplog.set_level(logging.INFO, logger="s4hc-mcp.audit")
+
+    class Msg:
+        name, arguments = "fiscal_context", {}
+
+    def call(ctx):
+        class MC:
+            message = Msg()
+            fastmcp_context = ctx
+
+        async def ok(_):
+            return "ok"
+        return asyncio.run(mw.on_call_tool(MC(), ok))
+
+    victim = header_ctx("real-pw", user="victim")
+    dependencies.mark_verified(dependencies.resolve_connection(victim).fingerprint)
+    for i in range(10):  # attacker knows the victim's host and user, not the password
+        try:
+            call(header_ctx(f"guess-{i}", user="victim"))
+        except S4HCError:
+            pass
+    assert call(victim) == "ok" and call(None) == "ok"  # accepted tenant and the server's own connection unaffected
+    unverified = [r.getMessage() for r in caplog.records if "trusted=False" in r.getMessage()]
+    assert len({m.split("conn=")[1].split()[0] for m in unverified}) > 1  # distinct connections stay distinguishable
+
+
+def test_sap_answer_marks_credentials_verified(tool):
+    ctx = header_ctx("pw-ok")
+    assert dependencies.rate_limit_key(ctx)[1] is False
+    tool("list_company_codes")(ctx=ctx)
+    assert dependencies.rate_limit_key(ctx)[1] is True
+    fake_s4hc.STATE["bad_auth"] = True
+    bad = header_ctx("pw-wrong")
+    with pytest.raises(S4HCError):
+        tool("list_company_codes")(ctx=bad)
+    assert dependencies.rate_limit_key(bad)[1] is False
+
+
+def test_streamed_body_capped_without_content_length(monkeypatch):
+    import requests
+
+    from src.s4hc import client as client_mod
+    monkeypatch.setattr(client_mod, "MAX_RESPONSE_BYTES", 10)
+    r = requests.Response()
+    r.status_code, r.headers = 200, {}
+    r.raw = __import__("io").BytesIO(b'{"d": {"results": []}}')
+    with pytest.raises(S4HCError, match="QUERY_TOO_LARGE"):
+        client_mod._read_capped(r)

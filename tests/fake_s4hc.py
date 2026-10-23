@@ -136,6 +136,9 @@ class FakeResp:
             raise ValueError
         return self._payload
 
+    def close(self):
+        pass
+
 
 def _forbidden(msg="Forbidden"):
     return FakeResp(403, {"error": {"message": {"value": msg}}})

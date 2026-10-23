@@ -57,6 +57,7 @@ def patch_backend(monkeypatch):
                            redirect=False)
     dependencies._cached.clear()
     dependencies._master_cache.clear()
+    dependencies._verified.clear()
     yield
 
 

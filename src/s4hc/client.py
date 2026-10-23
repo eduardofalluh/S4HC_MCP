@@ -15,7 +15,7 @@ import re
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import requests
 
@@ -129,6 +129,36 @@ def _retry_after(value: str | None, attempt: int) -> float:
     return min(max(wait, 0.0), MAX_RETRY_WAIT)
 
 
+def _close(r: Any) -> None:
+    close = getattr(r, "close", None)
+    if callable(close):
+        close()
+
+
+def _read_capped(r: Any) -> Any:
+    """Read a streamed body, refusing it past MAX_RESPONSE_BYTES whatever the
+    server declares (chunked bodies have no Content-Length)."""
+    try:
+        declared = int(r.headers.get("Content-Length") or 0)
+    except (TypeError, ValueError):
+        declared = 0
+    if declared > MAX_RESPONSE_BYTES:
+        _close(r)
+        raise S4HCError(f"Response of {declared} bytes exceeds the {MAX_RESPONSE_BYTES} byte limit", "QUERY_TOO_LARGE")
+    if not isinstance(r, requests.Response):
+        return r
+    chunks, total = [], 0
+    for chunk in r.iter_content(chunk_size=65536):
+        total += len(chunk)
+        if total > MAX_RESPONSE_BYTES:
+            _close(r)
+            raise S4HCError(f"Response exceeds the {MAX_RESPONSE_BYTES} byte limit", "QUERY_TOO_LARGE")
+        chunks.append(chunk)
+    r._content = b"".join(chunks)
+    r._content_consumed = True
+    return r
+
+
 class S4HCClient:
     def __init__(
         self,
@@ -138,8 +168,10 @@ class S4HCClient:
         cert: str | tuple[str, str] | None = None,
         timeout: int = 60,
         retries: int = 3,
+        on_verified: Callable[[], None] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        self._on_verified = on_verified
         self.timeout = timeout
         self.retries = retries
         self.session = requests.Session()
@@ -165,7 +197,7 @@ class S4HCClient:
                 break
             try:
                 r = self.session.get(url, params=params, headers={"Accept": accept},
-                                     timeout=min(self.timeout, remaining), allow_redirects=False)
+                                     timeout=min(self.timeout, remaining), allow_redirects=False, stream=True)
             except requests.RequestException as exc:
                 last_exc = exc
                 if attempt < self.retries:
@@ -175,24 +207,22 @@ class S4HCClient:
             if r.status_code in RETRY_STATUS and attempt < self.retries:
                 wait = _retry_after(r.headers.get("Retry-After"), attempt)
                 if time.monotonic() + wait >= deadline:
-                    return r
+                    return _read_capped(r)
+                _close(r)
                 log.warning("HTTP %s from S/4HANA Cloud, retrying in %.1fs", r.status_code, wait)
                 time.sleep(wait)
                 continue
-            return r
+            return _read_capped(r)
         if last_exc is not None:
             raise S4HCError(f"Request failed after retries: {last_exc.__class__.__name__}", "SAP_UNAVAILABLE")
         raise S4HCError(f"S/4HANA Cloud did not answer within {config.get_request_deadline():.0f}s", "SAP_UNAVAILABLE")
 
     def _raise_for_status(self, r: requests.Response, url: str) -> None:
-        try:
-            size = int(r.headers.get("Content-Length") or 0)
-        except (TypeError, ValueError):
-            size = 0
-        if size > MAX_RESPONSE_BYTES:
-            raise S4HCError(f"Response of {size} bytes exceeds the {MAX_RESPONSE_BYTES} byte limit", "QUERY_TOO_LARGE")
         if r.status_code < 300:
-            self.verified = True
+            if not self.verified:
+                self.verified = True
+                if self._on_verified:
+                    self._on_verified()
             return
         path = url.replace(self.base_url, "").split("?")[0]
         if r.status_code < 400:
