@@ -1,9 +1,26 @@
+# Environment / secrets
 .env
+.env.*
+!.env.example
 *.pem
 *.key
 *.pfx
+*.p12
+
+# Python
 venv/
 .venv/
 __pycache__/
+*.py[cod]
 .pytest_cache/
+
+# Logs
 *.log
+
+# Claude Code: local state stays out; the shared team settings are tracked
+.claude/*
+!.claude/settings.json
+
+# Claude Code: personal files, never committed
+.claude/settings.local.json
+CLAUDE.local.md
