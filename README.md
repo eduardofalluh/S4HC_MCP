@@ -100,7 +100,7 @@ cp .env.example .env   # fill in S4HC_BASE_URL + credentials
 
 python server.py                      # stdio
 python server.py --http --port 8000   # http://127.0.0.1:8000/mcp
-python -m pytest tests -q             # 169 tests: unit (fake OData backend that mimics a real tenant) + HTTP end-to-end
+python -m pytest tests -q             # 190 tests: unit (fake OData backend that mimics a real tenant) + HTTP end-to-end
 python scripts/live_smoke.py          # all 16 tools against the tenant in S4HC_* (read-only)
 ```
 

@@ -163,7 +163,10 @@ def _startup_check() -> None:
     from src.s4hc.dependencies import connection_info
 
     info = connection_info(None)
-    if info["auth_mode"] == "none":
+    mode = (os.getenv("S4HC_SAP_AUTH") or "").strip().lower()
+    if info["auth_mode"] == "none" and mode not in ("", "basic", "x509"):
+        log.warning("S4HC_SAP_AUTH=%s is not usable: %s", mode, info["base_url"])
+    elif info["auth_mode"] == "none":
         log.warning("No S4HC_USER/S4HC_PASSWORD or client certificate set — expecting per-request x-s4hc-* headers.")
     else:
         log.info("S/4HANA Cloud target %s (auth=%s, ledger=%s)", info["base_url"], info["auth_mode"], info["default_ledger"])

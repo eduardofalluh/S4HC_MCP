@@ -12,6 +12,8 @@ AI client ──(1) who is calling?──▶ S4HC_MCP ──(2) who are we at SA
 | 2. MCP → S/4HANA | `S4HC_SAP_AUTH` | `basic` (default), `x509`, **`oauth2_client_credentials`**, **`destination`**, **`principal_propagation`**, **`user_token`** |
 
 Bold = added in this change. Defaults are unchanged: without the new variables the server behaves exactly as before.
+Unset, `S4HC_SAP_AUTH` keeps the old rule (client certificate if one is configured, else the password);
+`basic` forces the password and `x509` requires a certificate.
 
 ## Which combination to pick
 
@@ -25,8 +27,13 @@ Bold = added in this change. Defaults are unchanged: without the new variables t
 | Each user as themselves, **no BTP** (CALM_MCP pattern) | S/4HANA sign-in | `user_token` | Communication user with OAuth 2.0 authorization-code grant; MCP client that does OAuth (GenAI Studio does for CALM) |
 
 Per-user modes are strict, like ARC-1's `SAP_PP_STRICT`: a call without a signed-in user (stdio, API key)
-is refused; nothing ever falls back to a shared SAP identity. The data-scope allowlists still apply on
+is refused, and so is a `principal_propagation` destination whose Authentication is a technical one
+(`BasicAuthentication`, `OAuth2ClientCredentials`, `NoAuthentication`, or a SAML bearer destination with a
+`SystemUser`); nothing ever falls back to a shared SAP identity. The data-scope allowlists still apply on
 top, as a second layer.
+
+With OIDC, each signed-in user gets their own rate-limit bucket (`S4HC_RATE_LIMIT_PER_MIN`), also on a
+shared SAP identity; `S4HC_RATE_LIMIT_GLOBAL_PER_MIN` still caps them together.
 
 ## What ARC-1 does, and what we took from it
 
@@ -86,7 +93,9 @@ API key as an identity without a user, and logging the verified subject instead 
 
 Tokens need a valid signature, issuer, audience, `exp`, `sub` and (if present) `nbf`. Unauthenticated calls
 get `401` with `WWW-Authenticate: Bearer resource_metadata=".../.well-known/oauth-protected-resource/mcp"`,
-which is how MCP clients find the sign-in. `S4HC_MCP_API_KEY` stays valid as a bearer token for automation.
+which is how MCP clients find the sign-in. `S4HC_MCP_API_KEY` stays valid for automation, but only as
+`Authorization: Bearer <key>`: once OIDC or the S/4HANA sign-in is on, the `x-api-key` header is no
+longer read.
 
 ### Hop 2 — `oauth2_client_credentials`
 
@@ -105,7 +114,7 @@ check it on the tenant before relying on this mode.**
 
 Set `S4HC_BTP_DESTINATION=<name>` and bind the Destination service: on Cloud Foundry bind an instance
 (`VCAP_SERVICES` is read); elsewhere set `S4HC_DESTINATION_SERVICE_URL` (`uri`),
-`S4HC_DESTINATION_TOKEN_URL` (`url` + `/oauth/token`), `S4HC_DESTINATION_CLIENT_ID`,
+`S4HC_DESTINATION_TOKEN_URL` (`url`; `/oauth/token` is added when it has no path), `S4HC_DESTINATION_CLIENT_ID`,
 `S4HC_DESTINATION_CLIENT_SECRET` from a service key. The destination supplies the SAP host; `S4HC_BASE_URL`
 is not used in these modes.
 
@@ -126,23 +135,32 @@ is not used in these modes.
    only accepts user tokens its subaccount trusts.
 
 **Private cloud / on-premise, per user**: destination Proxy Type **OnPremise**, Authentication
-**PrincipalPropagation**, URL = Cloud Connector virtual host (may be `http://`), `sap-client`; Cloud
-Connector principal propagation + STRUST + CERTRULE as described above. Bind the Connectivity service
-(`VCAP_SERVICES`) or set `S4HC_CONNECTIVITY_PROXY`, `S4HC_CONNECTIVITY_TOKEN_URL`,
-`S4HC_CONNECTIVITY_CLIENT_ID`, `S4HC_CONNECTIVITY_CLIENT_SECRET`. **The connectivity proxy is only reachable
+**PrincipalPropagation**, URL = Cloud Connector virtual host, which **must be `http://`** (the connectivity
+credentials are proxy headers, and for an `https://` URL they would be tunnelled to the backend instead;
+TLS to the backend is configured in Cloud Connector), `sap-client`; Cloud Connector principal propagation +
+STRUST + CERTRULE as described above. Bind the Connectivity service (`VCAP_SERVICES`; its `token_service_url`
+is the UAA base and `/oauth/token` is added, per SAP's
+[Consuming the Connectivity Service](https://help.sap.com/docs/r/cca91383641e40ffbe03bdc78f00f681/Cloud/en-US/313b215066a8400db461b311e01bd99b.html))
+or set `S4HC_CONNECTIVITY_PROXY`, `S4HC_CONNECTIVITY_TOKEN_URL`, `S4HC_CONNECTIVITY_CLIENT_ID`,
+`S4HC_CONNECTIVITY_CLIENT_SECRET`. Only the client-secret binding type is supported (not the X.509 one). **The connectivity proxy is only reachable
 from inside BTP Cloud Foundry or Kyma**, so this mode means deploying S4HC_MCP there, not on GenAI Studio's
 own cluster. The server exchanges the user token at the connectivity service (jwt-bearer) and sends it as
 `Proxy-Authorization`, SAP's recommended variant.
 
 `destination` (no user) reads a technical destination (`BasicAuthentication`, `OAuth2ClientCredentials`,
 …) instead of `S4HC_*` credentials — useful to keep SAP passwords in BTP rather than in this deployment.
+The destination is looked up again when its credentials expire (at most every 5 minutes), so a password
+rotated in BTP is picked up without a restart.
 
 ### Hop 2 — `user_token` (S/4HANA sign-in, no BTP)
 
 The CALM_MCP pattern: the MCP client signs the user in at S/4HANA's OAuth server (authorization code) and
 sends the S/4HANA token as `Authorization: Bearer`. This server publishes RFC 9728 metadata pointing at
 itself and an RFC 8414 document describing S/4HANA's endpoints (S/4HANA publishes none), checks each new
-token with one `$metadata` read, then forwards it. Set `S4HC_SAP_AUTH=user_token`, `S4HC_PUBLIC_URL`,
+token with one `$metadata` read, then forwards it. These checks happen before the caller is
+authenticated, so they are bounded: accepted tokens are cached 5 minutes, refused ones 1 minute, and at
+most `S4HC_SAP_TOKEN_CHECKS_PER_MIN` (default 60) new tokens are checked per minute, 8 at a time; over that,
+a new token gets `401` without SAP being asked. Set `S4HC_SAP_AUTH=user_token`, `S4HC_PUBLIC_URL`,
 `S4HC_SAP_OAUTH_SCOPES` (the arrangement's OAuth scopes), optional `S4HC_SAP_OAUTH_AUTHORIZE_URL`
 (default `https://<tenant>.s4hana.cloud.sap/sap/bc/sec/oauth2/authorize` — present on Gamma) and
 `S4HC_SAP_OAUTH_PKCE` (default true; verify the tenant supports PKCE). S/4HANA tokens are opaque, so this

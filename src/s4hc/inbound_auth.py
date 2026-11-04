@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import os
 import secrets
 import threading
@@ -36,11 +37,16 @@ from starlette.routing import Route
 
 from . import config
 from .errors import S4HCError
+from .governance import _TokenBucket
 
 CLOCK_SKEW_SECONDS = 60
 SAP_TOKEN_CHECK_TTL = 300
+SAP_TOKEN_REFUSED_TTL = 60
+SAP_TOKEN_CHECK_CONCURRENCY = 8
 MAX_CHECKED_SAP_TOKENS = 4096
 _KEY = secrets.token_bytes(32)
+
+log = logging.getLogger("s4hc-mcp.inbound-auth")
 
 
 def _csv(value: str | None) -> list[str]:
@@ -101,23 +107,41 @@ class ApiKeyOrVerifier(TokenVerifier):
 
 class SapUserTokenVerifier(TokenVerifier):
     """S/4HANA access tokens are opaque, so the only authority that can check one is
-    S/4HANA itself: a $metadata read with the token must succeed. Positive results
-    are cached briefly per token (keyed by HMAC, never the token itself)."""
+    S/4HANA itself: a $metadata read with the token must succeed. Results are cached
+    per token (keyed by HMAC, never the token itself): accepted ones for
+    SAP_TOKEN_CHECK_TTL, refused ones for SAP_TOKEN_REFUSED_TTL. Checks run before
+    any other limit applies (the caller is not authenticated yet), so the ones that
+    miss the cache are bounded: S4HC_SAP_TOKEN_CHECKS_PER_MIN across all callers and
+    SAP_TOKEN_CHECK_CONCURRENCY at a time. Over the bound a token is refused (401)
+    without asking SAP; tokens already accepted keep working from the cache."""
 
     def __init__(self) -> None:
         super().__init__()
         self._ok: OrderedDict[str, float] = OrderedDict()
+        self._refused: OrderedDict[str, float] = OrderedDict()
         self._lock = threading.Lock()
+        self._checks = _TokenBucket(int(os.getenv("S4HC_SAP_TOKEN_CHECKS_PER_MIN", "60")))
+        self._in_flight = threading.BoundedSemaphore(SAP_TOKEN_CHECK_CONCURRENCY)
 
-    def _check(self, token: str) -> bool:
+    def _check(self, token: str) -> bool | None:
+        """True: SAP accepted the token. False: SAP refused it. None: no answer."""
         base = config.get_base_url(None)
         try:
             r = requests.get(f"{base}{config.JOURNAL_ITEM_SERVICE}/$metadata", timeout=15, allow_redirects=False,
                              headers={"Authorization": f"Bearer {token}", "Accept": "application/xml"}, stream=True)
             r.close()
         except requests.RequestException:
-            return False
-        return r.status_code == 200
+            return None
+        if r.status_code == 200:
+            return True
+        return False if r.status_code in (401, 403) else None
+
+    def _remember(self, cache: OrderedDict[str, float], k: str, until: float) -> None:
+        with self._lock:
+            cache[k] = until
+            cache.move_to_end(k)
+            while len(cache) > MAX_CHECKED_SAP_TOKENS:
+                cache.popitem(last=False)
 
     async def verify_token(self, token: str) -> AccessToken | None:
         if not token or len(token) > 8192:
@@ -125,14 +149,22 @@ class SapUserTokenVerifier(TokenVerifier):
         k = hmac.new(_KEY, token.encode(), hashlib.sha256).hexdigest()
         now = time.time()
         with self._lock:
-            ok_until = self._ok.get(k)
+            ok_until, refused_until = self._ok.get(k), self._refused.get(k)
+        if refused_until and refused_until > now:
+            return None
         if not ok_until or ok_until < now:
-            if not await anyio.to_thread.run_sync(self._check, token):
+            if not self._checks.allow() or not self._in_flight.acquire(blocking=False):
+                log.warning("S/4HANA token check refused without asking SAP: check budget or concurrency exhausted")
                 return None
-            with self._lock:
-                self._ok[k] = now + SAP_TOKEN_CHECK_TTL
-                while len(self._ok) > MAX_CHECKED_SAP_TOKENS:
-                    self._ok.popitem(last=False)
+            try:
+                ok = await anyio.to_thread.run_sync(self._check, token)
+            finally:
+                self._in_flight.release()
+            if ok is False:
+                self._remember(self._refused, k, now + SAP_TOKEN_REFUSED_TTL)
+            if not ok:
+                return None
+            self._remember(self._ok, k, now + SAP_TOKEN_CHECK_TTL)
         return AccessToken(token=token, client_id="s4hana-oauth", scopes=[], expires_at=None,
                            claims={"s4hc_sap_user_token": True})
 

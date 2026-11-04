@@ -15,6 +15,7 @@ host named in a request header.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import os
@@ -111,6 +112,14 @@ def _access_token(ctx: Context | None):
         return None
 
 
+def _signed_in_subject(ctx: Context | None) -> str | None:
+    """issuer + subject of a verified user token (OIDC), or None (API key, SAP token, stdio)."""
+    claims = getattr(_access_token(ctx), "claims", None) or {}
+    if claims.get("sub") and not claims.get("s4hc_api_key"):
+        return f"{claims.get('iss', '')}|{claims['sub']}"
+    return None
+
+
 def caller_identity(ctx: Context | None) -> str | None:
     """Audit identity of a signed-in caller: the token's subject, never a header."""
     tok = _access_token(ctx)
@@ -126,7 +135,11 @@ def caller_identity(ctx: Context | None) -> str | None:
 
 def _user_connection(ctx: Context | None, mode: str) -> Connection:
     """Principal propagation / SAP user token: the SAP identity is the signed-in user's,
-    so header credentials, a header base URL or an API-key caller are refused."""
+    so header credentials, a header base URL or an API-key caller are refused.
+    Server configuration is checked first, so UNAUTHORIZED_SCOPE always means
+    "configured, but this call has no usable user"."""
+    url = config.get_base_url(None) if mode == "user_token" else ""
+    dest = _destination_name() if mode == "principal_propagation" else ""
     if _header(ctx, HEADER_PREFIX + "user") or _header(ctx, HEADER_PREFIX + "password") \
             or _header(ctx, HEADER_PREFIX + "base-url"):
         raise S4HCError(f"S4HC_SAP_AUTH={mode}: the SAP identity comes from the user's sign-in; "
@@ -138,14 +151,13 @@ def _user_connection(ctx: Context | None, mode: str) -> Connection:
             raise S4HCError("This deployment runs every call as the signed-in S/4HANA user; sign in through the "
                             "MCP client's OAuth flow (an API key carries no SAP user)", "UNAUTHORIZED_SCOPE")
         token = str(tok.token)
-        return Connection(config.get_base_url(None), None, None, None, "user_token",
+        return Connection(url, None, None, None, "user_token",
                           identity=hashlib.sha256(token.encode()).hexdigest(),
                           headers=lambda: {"Authorization": f"Bearer {token}"})
     if not claims.get("sub") or claims.get("s4hc_api_key"):
         raise S4HCError("Principal propagation runs every call as the signed-in user; this call has no user token "
                         "(API keys and stdio carry no user). Nothing falls back to a shared SAP identity.",
                         "UNAUTHORIZED_SCOPE")
-    dest = _destination_name()
     user_jwt = str(tok.token)
     from . import sap_auth
     return Connection("", None, None, None, "principal_propagation",
@@ -204,37 +216,58 @@ def resolve_connection(ctx: Context | None = None) -> Connection:
     if mode not in ("", "basic", "x509"):
         raise S4HCError(f"Unknown S4HC_SAP_AUTH {mode!r}: use basic, x509, oauth2_client_credentials, destination, "
                         "principal_propagation or user_token", "NOT_CONFIGURED")
-    cert = config.resolve_client_cert()
+    # Unset: certificate if one is configured, else the password. An explicit mode is enforced.
+    cert = None if mode == "basic" else config.resolve_client_cert()
+    if mode == "x509" and not cert:
+        raise S4HCError("S4HC_SAP_AUTH=x509 needs S4HC_CLIENT_CERT + S4HC_CLIENT_KEY (or S4HC_CLIENT_CERT_PEM)",
+                        "NOT_CONFIGURED")
     user, password = os.getenv("S4HC_USER"), os.getenv("S4HC_PASSWORD")
     if cert:
         return Connection(url, user, None, cert, "env")
     return Connection(url, user, password, None, "env")
 
 
+def _target_headers(resolver: Callable[[], Any], base_url: str, proxy_url: str | None) -> Callable[[], dict[str, str]]:
+    """Credentials of the current destination lookup, on every request, so a rotated
+    password or token is picked up. A destination that now points at another host or
+    proxy fails the request instead of sending its credential to the old one."""
+    def headers() -> dict[str, str]:
+        t = resolver()
+        if (t.base_url, t.proxy_url) != (base_url, proxy_url):
+            raise S4HCError("The BTP destination's URL or proxy changed during this call; retry", "SAP_UNAVAILABLE")
+        h = dict(t.headers)
+        if t.basic and "Authorization" not in h:
+            h["Authorization"] = "Basic " + base64.b64encode(f"{t.basic[0]}:{t.basic[1]}".encode()).decode()
+        if t.sap_client:
+            h["sap-client"] = t.sap_client
+        return h
+    return headers
+
+
 def build_client(conn: Connection, *, timeout: int = 60, retries: int = 3,
                  on_verified: Callable[[], None] | None = None) -> S4HCClient:
     if conn.target is not None:
         first = conn.target()
-        resolver = conn.target
-        return S4HCClient(first.base_url, user=first.basic[0] if first.basic else None,
-                          password=first.basic[1] if first.basic else None,
-                          auth_headers=lambda: dict(resolver().headers), proxy_url=first.proxy_url,
-                          sap_client=first.sap_client, timeout=timeout, retries=retries, on_verified=on_verified)
+        return S4HCClient(first.base_url, auth_headers=_target_headers(conn.target, first.base_url, first.proxy_url),
+                          proxy_url=first.proxy_url, timeout=timeout, retries=retries, on_verified=on_verified)
     return S4HCClient(conn.base_url, user=conn.user, password=conn.password, cert=conn.cert,
                       auth_headers=conn.headers, timeout=timeout, retries=retries, on_verified=on_verified)
 
 
 def get_client(ctx: Context | None = None) -> S4HCClient:
     conn = resolve_connection(ctx)
-    key = conn.fingerprint
+    fp = key = conn.fingerprint
     if conn.per_call:  # bound to this request's user token: never reused for another call
-        return build_client(conn, on_verified=lambda: mark_verified(key))
+        return build_client(conn, on_verified=lambda: mark_verified(fp))
+    if conn.target is not None:  # the destination picks host and proxy: a changed one gets its own client
+        t = conn.target()
+        key = f"{fp}|{t.base_url}|{t.proxy_url or ''}"
     with _lock:
         client = _cached.get(key)
         if client is not None:
             _cached.move_to_end(key)
             return client
-    client = build_client(conn, on_verified=lambda: mark_verified(key))
+    client = build_client(conn, on_verified=lambda: mark_verified(fp))
     with _lock:
         _cached[key] = client
         while len(_cached) > MAX_CLIENTS:
@@ -259,18 +292,24 @@ def mark_verified(fingerprint: str) -> None:
 
 
 def rate_limit_key(ctx: Context | None = None) -> tuple[str, bool]:
-    """(connection fingerprint, trusted). The server's own env connection and any
-    credential SAP has already accepted are trusted; everything else is an
-    unverified caller, limited separately so it cannot crowd out trusted ones."""
+    """(bucket key, trusted). The server's own env connection and any credential SAP
+    has already accepted are trusted; everything else is an unverified caller,
+    limited separately so it cannot crowd out trusted ones. A signed-in (OIDC) user
+    gets a bucket of their own even on a shared SAP identity, so one user cannot use
+    up the budget of everyone else on that identity."""
     try:
         conn = resolve_connection(ctx)
     except S4HCError:
         return "unresolved", False
+    key = conn.fingerprint
+    subject = _signed_in_subject(ctx)
+    if subject:
+        key = hmac.new(_FINGERPRINT_KEY, f"{key}\0{subject}".encode(), hashlib.sha256).hexdigest()[:32]
     # Server-configured identities, and users whose token this server verified itself.
     if conn.source in ("env", "oauth2", "destination", "principal_propagation"):
-        return conn.fingerprint, True
+        return key, True
     with _lock:
-        return conn.fingerprint, conn.fingerprint in _verified
+        return key, conn.fingerprint in _verified
 
 
 def cached(ctx: Context | None, key: str, loader: Callable[[], Any]) -> Any:
@@ -312,8 +351,14 @@ def connection_info(ctx: Context | None = None) -> dict[str, Any]:
         else:
             auth_mode = "basic" if conn.user and conn.password else "none"
     except S4HCError as exc:
-        base_url = f"<unset: {exc}>"
-        auth_mode = modes.get(sap_auth_mode().replace("oauth2_client_credentials", "oauth2"), "none")
+        base_url, auth_mode = f"<unset: {exc}>", "none"
+        mode = sap_auth_mode()
+        # Per-user modes check their configuration first, so UNAUTHORIZED_SCOPE here only
+        # means no signed-in user on this call (startup, stdio): configured, not broken.
+        if exc.code == "UNAUTHORIZED_SCOPE" and mode in ("principal_propagation", "user_token"):
+            auth_mode = modes[mode]
+            base_url = (f"<per signed-in user, BTP destination {_destination_name()}>"
+                        if mode == "principal_propagation" else config.get_base_url(None))
     d = get_defaults(ctx)
     mcp_auth = ("sap-oauth" if sap_auth_mode() == "user_token" else "oidc" if oidc_enabled()
                 else "api-key" if os.getenv("S4HC_MCP_API_KEY") else "none")

@@ -171,7 +171,6 @@ class S4HCClient:
         on_verified: Callable[[], None] | None = None,
         auth_headers: Callable[[], dict[str, str]] | None = None,
         proxy_url: str | None = None,
-        sap_client: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._on_verified = on_verified
@@ -189,8 +188,6 @@ class S4HCClient:
                 "NOT_CONFIGURED"
             )
         self.session.headers.update({"Accept": "application/json"})
-        if sap_client:
-            self.session.headers["sap-client"] = sap_client
         if proxy_url:  # BTP Connectivity proxy (OnPremise destinations); never the environment's proxy
             self.session.trust_env = False
             self.session.proxies = {"http": proxy_url, "https": proxy_url}

@@ -64,6 +64,14 @@ class FakeBTP:
                           "Authentication": "OAuth2SAMLBearerAssertion"},
             "S4_EVIL_URL": {"URL": "https://my-api.s4hana.cloud.sap/sap?x=1", "ProxyType": "Internet",
                             "Authentication": "BasicAuthentication", "User": "u", "Password": RUN["basic_pw"]},
+            "S4_TECH_CC": {"URL": "https://my-api.s4hana.cloud.sap", "ProxyType": "Internet",
+                           "Authentication": "OAuth2ClientCredentials"},
+            "S4_SAML_SYSTEMUSER": {"URL": "https://my-api.s4hana.cloud.sap", "ProxyType": "Internet",
+                                   "Authentication": "OAuth2SAMLBearerAssertion", "SystemUser": "COMM_TECH"},
+            "S4_ONPREM_TECH": {"URL": "http://s4d-tech:50101", "ProxyType": "OnPremise",
+                               "Authentication": "BasicAuthentication", "User": "COMM_TECH", "Password": RUN["basic_pw"]},
+            "S4_ONPREM_HTTPS": {"URL": "https://s4d-pp:44301", "ProxyType": "OnPremise",
+                                "Authentication": "PrincipalPropagation"},
         }
 
     def post(self, url, data=None, auth=None, **kw):
@@ -95,6 +103,10 @@ class FakeBTP:
         tokens = []
         if name == "S4_BROKEN" and user:
             tokens = [{"type": "", "value": "", "error": "Retrieval of OAuthToken failed: SAML trust missing"}]
+        elif conf["Authentication"] == "OAuth2ClientCredentials":
+            tokens = [{"type": "Bearer", "value": "s4-tech-token", "expires_in": "3600"}]
+        elif conf["Authentication"] == "OAuth2SAMLBearerAssertion" and conf.get("SystemUser"):
+            tokens = [{"type": "Bearer", "value": "s4-system-user-token", "expires_in": "3600"}]
         elif conf["Authentication"] == "OAuth2SAMLBearerAssertion" and user:
             tok = f"s4-user-{_sub(user)}"
             tokens = [{"type": "Bearer", "value": tok, "expires_in": "3600",
@@ -146,6 +158,10 @@ def odata_calls(calls):
     return [c for c in calls if "/sap/opu/odata/" in c["path"]]
 
 
+def basic_header(user: str, password: str) -> str:
+    return "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
+
+
 def pp(monkeypatch, destination):
     monkeypatch.setenv("S4HC_SAP_AUTH", "principal_propagation")
     monkeypatch.setenv("S4HC_BTP_DESTINATION", destination)
@@ -190,7 +206,8 @@ def test_technical_destination_supplies_host_and_credentials(tool, calls, btp, m
     monkeypatch.setenv("S4HC_BTP_DESTINATION", "S4_TECH_BASIC")
     monkeypatch.delenv("S4HC_BASE_URL")
     assert tool("list_company_codes")(ctx=None)["count"] == 2
-    assert odata_calls(calls)[0]["auth"] == ("COMM_TECH", RUN["basic_pw"])
+    assert odata_calls(calls)[0]["headers"]["Authorization"] == basic_header("COMM_TECH", RUN["basic_pw"])
+    assert odata_calls(calls)[0]["auth"] is None  # per request, so a rotated password is picked up
     assert odata_calls(calls)[0]["host"] == "my-api.s4hana.cloud.sap" and btp.lookups[0]["user"] is None
     info = tool("s4hc_health")(ctx=None)
     assert info["auth_mode"] == "btp-destination" and RUN["basic_pw"] not in json.dumps(info)
@@ -208,6 +225,64 @@ def test_destination_url_must_be_a_plain_origin(tool, btp, monkeypatch):
     monkeypatch.setenv("S4HC_BTP_DESTINATION", "S4_EVIL_URL")
     with pytest.raises(S4HCError, match="plain https origin"):
         tool("list_company_codes")(ctx=None)
+
+
+def test_destination_credential_rotation_and_url_change_are_picked_up(tool, calls, btp, monkeypatch):
+    monkeypatch.setenv("S4HC_SAP_AUTH", "destination")
+    monkeypatch.setenv("S4HC_BTP_DESTINATION", "S4_TECH_BASIC")
+    tool("get_cost_center_actuals")(ctx=None, fiscal_year=2026)
+    rotated = secrets.token_urlsafe(12)
+    btp.destinations["S4_TECH_BASIC"]["Password"] = rotated
+    sap_auth.destination_service()._cache.clear()  # what the lookup cache's expiry does
+    calls.clear()
+    tool("get_cost_center_actuals")(ctx=None, fiscal_year=2026)
+    assert {c["headers"]["Authorization"] for c in odata_calls(calls)} == {basic_header("COMM_TECH", rotated)}
+    btp.destinations["S4_TECH_BASIC"]["URL"] = "https://other-api.s4hana.cloud.sap"
+    sap_auth.destination_service()._cache.clear()
+    calls.clear()
+    tool("get_cost_center_actuals")(ctx=None, fiscal_year=2026)
+    assert {c["host"] for c in odata_calls(calls)} == {"other-api.s4hana.cloud.sap"}
+
+
+def test_destination_change_during_a_call_fails_instead_of_resending(monkeypatch):
+    targets = iter([sap_auth.SapTarget("https://my-api.s4hana.cloud.sap", {"Authorization": "Bearer a"}, 0),
+                    sap_auth.SapTarget("https://other-api.s4hana.cloud.sap", {"Authorization": "Bearer b"}, 0)])
+    headers = dependencies._target_headers(lambda: next(targets), "https://my-api.s4hana.cloud.sap", None)
+    assert headers() == {"Authorization": "Bearer a"}
+    with pytest.raises(S4HCError, match="changed during this call"):
+        headers()
+
+
+def test_on_premise_destination_must_be_http(tool, btp, as_user, monkeypatch):
+    pp(monkeypatch, "S4_ONPREM_HTTPS")
+    as_user(signed_in("alice"))
+    with pytest.raises(S4HCError, match="plain http origin.*Cloud Connector"):
+        tool("list_company_codes")(ctx=None)
+    assert not [p for p in btp.posts if p["url"] == CONN_UAA]  # no user exchange for a URL that cannot work
+
+
+@pytest.mark.parametrize("token_service_url,expected", [
+    ("https://sub.authentication.eu10.hana.ondemand.com", "https://sub.authentication.eu10.hana.ondemand.com/oauth/token"),
+    ("https://sub.authentication.eu10.hana.ondemand.com/", "https://sub.authentication.eu10.hana.ondemand.com/oauth/token"),
+    ("https://sub.authentication.eu10.hana.ondemand.com/oauth/token",
+     "https://sub.authentication.eu10.hana.ondemand.com/oauth/token"),
+    ("https://tenant.accounts.ondemand.com/oauth2/token", "https://tenant.accounts.ondemand.com/oauth2/token"),
+])
+def test_connectivity_binding_from_vcap_services(monkeypatch, token_service_url, expected):
+    monkeypatch.setenv("VCAP_SERVICES", json.dumps({"connectivity": [{"credentials": {
+        "clientid": "conn-client", "clientsecret": RUN["conn_secret"], "token_service_url": token_service_url,
+        "onpremise_proxy_host": "connectivityproxy.internal", "onpremise_proxy_http_port": "20003"}}]}))
+    b = sap_auth.connectivity_binding()
+    assert (b.token_url, b.proxy_url) == (expected, "http://connectivityproxy.internal:20003")
+    assert RUN["conn_secret"] not in repr(b)
+
+
+def test_connectivity_binding_without_proxy_is_refused(monkeypatch):
+    monkeypatch.setenv("VCAP_SERVICES", json.dumps({"connectivity": [{"credentials": {
+        "clientid": "conn-client", "clientsecret": RUN["conn_secret"],
+        "token_service_url": "https://sub.authentication.eu10.hana.ondemand.com"}}]}))
+    with pytest.raises(S4HCError, match="onpremise_proxy_host"):
+        sap_auth.connectivity_binding()
 
 
 def test_destination_binding_from_vcap_services(monkeypatch):
@@ -257,6 +332,17 @@ def test_pp_never_falls_back_to_a_shared_identity(tool, calls, btp, as_user, mon
     with pytest.raises(S4HCError, match="UNAUTHORIZED_SCOPE"):
         tool("list_company_codes")(ctx=None)
     assert not odata_calls(calls) and not btp.lookups
+
+
+@pytest.mark.parametrize("destination", ["S4_TECH_BASIC", "S4_TECH_CC", "S4_SAML_SYSTEMUSER", "S4_ONPREM_TECH"])
+def test_pp_refuses_a_technical_destination(tool, calls, btp, as_user, monkeypatch, destination):
+    """A technical credential would run every signed-in user as one SAP identity."""
+    pp(monkeypatch, destination)
+    as_user(signed_in("alice"))
+    with pytest.raises(S4HCError, match="shared technical identity") as exc:
+        tool("list_company_codes")(ctx=None)
+    assert exc.value.code == "UNAUTHORIZED_SCOPE"
+    assert not odata_calls(calls) and not [p for p in btp.posts if p["url"] == CONN_UAA]
 
 
 def test_pp_refuses_header_credentials(btp, as_user, monkeypatch):
@@ -326,6 +412,42 @@ def test_sap_user_token_verifier_asks_sap_and_caches(monkeypatch):
     assert asyncio.run(v.verify_token("good")) is not None
     assert asyncio.run(v.verify_token("bad")) is None
     assert seen == ["Bearer good", "Bearer bad"]  # the second check of "good" came from the cache
+    assert asyncio.run(v.verify_token("bad")) is None
+    assert seen == ["Bearer good", "Bearer bad"]  # and so did the second refusal of "bad"
+
+
+def test_sap_user_token_checks_are_bounded(monkeypatch):
+    """Unauthenticated callers cannot use this server to drive unbounded traffic at SAP."""
+    seen = []
+
+    def fake_get(url, headers=None, **kw):
+        seen.append(headers["Authorization"])
+        return Resp(200 if headers["Authorization"] == "Bearer good" else 401, None)
+
+    monkeypatch.setattr(inbound_auth.requests, "get", fake_get)
+    monkeypatch.setenv("S4HC_SAP_TOKEN_CHECKS_PER_MIN", "3")
+    v = inbound_auth.SapUserTokenVerifier()
+    assert asyncio.run(v.verify_token("good")) is not None
+    for i in range(10):
+        assert asyncio.run(v.verify_token(f"guess-{i}")) is None
+    assert len(seen) == 3  # one accepted token + two guesses; the rest refused without asking SAP
+    assert asyncio.run(v.verify_token("good")) is not None  # an accepted token keeps working from the cache
+
+
+def test_sap_user_token_unreachable_sap_is_not_cached_as_refused(monkeypatch):
+    import requests as _requests
+    answers = iter([_requests.ConnectionError(), Resp(200, None)])
+
+    def fake_get(url, headers=None, **kw):
+        a = next(answers)
+        if isinstance(a, Exception):
+            raise a
+        return a
+
+    monkeypatch.setattr(inbound_auth.requests, "get", fake_get)
+    v = inbound_auth.SapUserTokenVerifier()
+    assert asyncio.run(v.verify_token("good")) is None
+    assert asyncio.run(v.verify_token("good")) is not None  # retried once SAP answers
 
 
 # ---------------------------------------------------------- inbound OIDC
@@ -378,6 +500,42 @@ def test_auth_misconfiguration_fails_at_startup(monkeypatch, env, match):
         monkeypatch.setenv(k, v)
     with pytest.raises(S4HCError, match=match):
         inbound_auth.build_auth_provider()
+
+
+def test_signed_in_users_get_their_own_rate_limit_bucket_on_a_shared_identity(as_user):
+    as_user(signed_in("alice"))
+    alice, trusted = dependencies.rate_limit_key(None)
+    assert trusted and alice == dependencies.rate_limit_key(None)[0]
+    as_user(signed_in("bob"))
+    bob = dependencies.rate_limit_key(None)[0]
+    as_user(None)
+    shared = dependencies.rate_limit_key(None)[0]
+    assert len({alice, bob, shared}) == 3
+    assert shared == dependencies.resolve_connection(None).fingerprint
+
+
+@pytest.mark.parametrize("env,status,auth_mode", [
+    ({"S4HC_SAP_AUTH": "oauth2_client_credentials", "S4HC_OAUTH_CLIENT_ID": "S4_OAUTH_CLIENT"}, "unconfigured", "none"),
+    ({"S4HC_SAP_AUTH": "destination"}, "unconfigured", "none"),
+    ({"S4HC_SAP_AUTH": "principal_propagation"}, "unconfigured", "none"),
+    ({"S4HC_SAP_AUTH": "principal_propagation", "S4HC_BTP_DESTINATION": "S4_PUBLIC_PP"}, "configured",
+     "principal-propagation"),
+    ({"S4HC_SAP_AUTH": "x509"}, "unconfigured", "none"),
+])
+def test_health_reports_missing_settings(tool, monkeypatch, env, status, auth_mode):
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    info = tool("s4hc_health")(ctx=None)
+    assert (info["status"], info["auth_mode"]) == (status, auth_mode)
+
+
+def test_explicit_basic_mode_ignores_a_configured_certificate(monkeypatch):
+    monkeypatch.setenv("S4HC_CLIENT_CERT", "/nonexistent/cert.pem")
+    monkeypatch.setenv("S4HC_CLIENT_KEY", "/nonexistent/key.pem")
+    assert dependencies.resolve_connection(None).cert == ("/nonexistent/cert.pem", "/nonexistent/key.pem")
+    monkeypatch.setenv("S4HC_SAP_AUTH", "basic")
+    conn = dependencies.resolve_connection(None)
+    assert conn.cert is None and conn.password
 
 
 def test_audit_uses_the_verified_subject(as_user):

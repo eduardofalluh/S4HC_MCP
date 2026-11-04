@@ -131,18 +131,28 @@ def _https(url: str, what: str) -> str:
     return url.rstrip("/")
 
 
+def _token_endpoint(url: str, what: str) -> str:
+    """Bindings and service keys give the UAA base (``token_service_url``, ``url``);
+    the token endpoint is ``<base>/oauth/token`` (SAP: "Consuming the Connectivity
+    Service"). A URL that already has a path (``/oauth/token``, IAS ``/oauth2/token``)
+    is used as given."""
+    url = _https(url, what)
+    return url + "/oauth/token" if urlsplit(url).path in ("", "/") else url
+
+
 def destination_binding() -> ServiceBinding:
     creds = _vcap_credentials("destination")
     if creds:
         return ServiceBinding(str(creds.get("clientid", "")), str(creds.get("clientsecret", "")),
-                              _https(str(creds.get("url", "")).rstrip("/") + "/oauth/token", "destination UAA url"),
+                              _token_endpoint(str(creds.get("url", "")), "destination UAA url"),
                               service_url=_https(str(creds.get("uri", "")), "destination service uri"))
     cid, secret = os.getenv("S4HC_DESTINATION_CLIENT_ID"), os.getenv("S4HC_DESTINATION_CLIENT_SECRET")
     if not (cid and secret and os.getenv("S4HC_DESTINATION_SERVICE_URL") and os.getenv("S4HC_DESTINATION_TOKEN_URL")):
         raise S4HCError("BTP Destination service not bound: bind a destination instance (VCAP_SERVICES) or set "
                         "S4HC_DESTINATION_SERVICE_URL, S4HC_DESTINATION_TOKEN_URL, S4HC_DESTINATION_CLIENT_ID "
                         "and S4HC_DESTINATION_CLIENT_SECRET from a service key", "NOT_CONFIGURED")
-    return ServiceBinding(cid, secret, _https(os.environ["S4HC_DESTINATION_TOKEN_URL"], "S4HC_DESTINATION_TOKEN_URL"),
+    return ServiceBinding(cid, secret, _token_endpoint(os.environ["S4HC_DESTINATION_TOKEN_URL"],
+                                                       "S4HC_DESTINATION_TOKEN_URL"),
                           service_url=_https(os.environ["S4HC_DESTINATION_SERVICE_URL"], "S4HC_DESTINATION_SERVICE_URL"))
 
 
@@ -150,10 +160,14 @@ def connectivity_binding() -> ServiceBinding:
     creds = _vcap_credentials("connectivity")
     if creds:
         host = creds.get("onpremise_proxy_host")
-        port = creds.get("onpremise_proxy_http_port") or creds.get("onpremise_proxy_port")
-        token_url = creds.get("token_service_url") or (str(creds.get("url", "")).rstrip("/") + "/oauth/token")
+        port = creds.get("onpremise_proxy_http_port") or creds.get("onpremise_proxy_port")  # _port is deprecated
+        if not host or not port:
+            raise S4HCError("connectivity binding has no onpremise_proxy_host / onpremise_proxy_http_port",
+                            "NOT_CONFIGURED")
+        token_url = creds.get("token_service_url") or creds.get("url")  # url is the deprecated name
         return ServiceBinding(str(creds.get("clientid", "")), str(creds.get("clientsecret", "")),
-                              _https(str(token_url), "connectivity token url"), proxy_url=f"http://{host}:{port}")
+                              _token_endpoint(str(token_url or ""), "connectivity token_service_url"),
+                              proxy_url=f"http://{host}:{port}")
     cid, secret, proxy = (os.getenv("S4HC_CONNECTIVITY_CLIENT_ID"), os.getenv("S4HC_CONNECTIVITY_CLIENT_SECRET"),
                           os.getenv("S4HC_CONNECTIVITY_PROXY"))
     if not (cid and secret and proxy and os.getenv("S4HC_CONNECTIVITY_TOKEN_URL")):
@@ -164,8 +178,8 @@ def connectivity_binding() -> ServiceBinding:
     if urlsplit(proxy).scheme != "http":
         raise S4HCError("S4HC_CONNECTIVITY_PROXY must be http://host:port (the in-cluster connectivity proxy)",
                         "NOT_CONFIGURED")
-    return ServiceBinding(cid, secret, _https(os.environ["S4HC_CONNECTIVITY_TOKEN_URL"], "S4HC_CONNECTIVITY_TOKEN_URL"),
-                          proxy_url=proxy)
+    return ServiceBinding(cid, secret, _token_endpoint(os.environ["S4HC_CONNECTIVITY_TOKEN_URL"],
+                                                       "S4HC_CONNECTIVITY_TOKEN_URL"), proxy_url=proxy)
 
 
 # ------------------------------------------------------------ resolved target
@@ -190,23 +204,28 @@ USER_TYPES = {"OAuth2SAMLBearerAssertion", "OAuth2UserTokenExchange", "OAuth2JWT
 
 def _destination_url(url: str, proxy_type: str) -> str:
     """Destination URLs are operator configuration, not caller input, so no SAP-domain
-    allowlist applies (private cloud hosts are customer DNS names). OnPremise URLs are
-    Cloud Connector virtual hosts addressed through the connectivity tunnel and may be
-    http; Internet destinations must be https."""
+    allowlist applies (private cloud hosts are customer DNS names). Internet
+    destinations must be https. OnPremise URLs are Cloud Connector virtual hosts and
+    must be http: the connectivity credentials travel as headers to the proxy, and
+    for an https URL requests would tunnel (CONNECT) and send them to the backend
+    instead. TLS to the backend is configured in Cloud Connector."""
     parts = urlsplit(url or "")
     on_prem = proxy_type == "OnPremise"
-    if (parts.scheme not in (("http", "https") if on_prem else ("https",)) or not parts.hostname
-            or parts.username or parts.password or parts.query or parts.fragment or parts.path not in ("", "/")):
-        raise S4HCError(f"Destination URL must be a plain {'http(s)' if on_prem else 'https'} origin "
-                        "(the OData service paths are appended by this server)", "NOT_CONFIGURED")
+    scheme = "http" if on_prem else "https"
+    if (parts.scheme != scheme or not parts.hostname or parts.username or parts.password or parts.query
+            or parts.fragment or parts.path not in ("", "/")):
+        raise S4HCError(f"Destination URL must be a plain {scheme} origin (the OData service paths are appended by "
+                        "this server)" + ("; an OnPremise URL is the Cloud Connector virtual host, with TLS to the "
+                                          "backend set up in Cloud Connector" if on_prem else ""), "NOT_CONFIGURED")
     return url.rstrip("/")
 
 
 class DestinationService:
     """Reads one destination, with or without a user token, and turns the answer
     into a SapTarget. Fails closed: an authTokens entry with an error, a user
-    destination without a user token, or a user destination that yields no
-    per-user credential is refused; nothing ever falls back to a shared identity."""
+    destination without a user token, a technical destination asked for with a
+    user token, or a user destination that yields no per-user credential is
+    refused; nothing ever falls back to a shared identity."""
 
     def __init__(self, binding: ServiceBinding | None = None, connectivity: ServiceBinding | None = None) -> None:
         self._binding = binding
@@ -272,6 +291,13 @@ class DestinationService:
         auth = str(conf.get("Authentication") or "NoAuthentication")
         proxy_type = str(conf.get("ProxyType") or "Internet")
         base_url = _destination_url(str(conf.get("URL") or ""), proxy_type)
+        if user_jwt and (auth not in USER_TYPES or conf.get("SystemUser")):
+            # The user asked to be propagated; a technical credential would run every
+            # signed-in user as the same SAP identity (and the deprecated SystemUser
+            # property turns a SAML bearer destination into exactly that).
+            raise S4HCError(f"Destination {name!r} uses {auth}" + (" with a SystemUser" if conf.get("SystemUser") else "")
+                            + ", a shared technical identity; principal propagation needs a destination that carries "
+                            "the end user (" + ", ".join(sorted(USER_TYPES)) + ")", "UNAUTHORIZED_SCOPE")
         if auth in USER_TYPES and not user_jwt:
             raise S4HCError(f"Destination {name!r} uses {auth}, which propagates the end user: it needs an "
                             "authenticated user token (S4HC_SAP_AUTH=principal_propagation with OIDC sign-in)",
