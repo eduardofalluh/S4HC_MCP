@@ -162,6 +162,22 @@ def basic_header(user: str, password: str) -> str:
     return "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
 
 
+def bearer_sent(url, headers=None, **kw):
+    """The Authorization header requests would really send for this call (auth objects and ~/.netrc included)."""
+    import requests as _rq
+    return _rq.Session().prepare_request(_rq.Request("GET", url, headers=headers, auth=kw.get("auth"))).headers.get(
+        "Authorization")
+
+
+def sap_checks(accepted: set[str], seen: list):
+    """A fake S/4HANA $metadata endpoint for the user-token verifier."""
+    def fake_get(url, headers=None, **kw):
+        sent = bearer_sent(url, headers, **kw)
+        seen.append(sent)
+        return Resp(200 if sent in {f"Bearer {t}" for t in accepted} else 401, None)
+    return fake_get
+
+
 def pp(monkeypatch, destination):
     monkeypatch.setenv("S4HC_SAP_AUTH", "principal_propagation")
     monkeypatch.setenv("S4HC_BTP_DESTINATION", destination)
@@ -242,6 +258,21 @@ def test_destination_credential_rotation_and_url_change_are_picked_up(tool, call
     calls.clear()
     tool("get_cost_center_actuals")(ctx=None, fiscal_year=2026)
     assert {c["host"] for c in odata_calls(calls)} == {"other-api.s4hana.cloud.sap"}
+
+
+def test_master_data_is_not_served_from_the_old_system_after_a_repoint(tool, calls, btp, monkeypatch):
+    monkeypatch.setenv("S4HC_SAP_AUTH", "destination")
+    monkeypatch.setenv("S4HC_BTP_DESTINATION", "S4_TECH_BASIC")
+    tool("list_company_codes")(ctx=None)
+    calls.clear()
+    tool("list_company_codes")(ctx=None)
+    assert not odata_calls(calls)  # same system: served from the master-data cache
+    for change in ({"URL": "https://other-api.s4hana.cloud.sap"}, {"sap-client": "200"}):
+        btp.destinations["S4_TECH_BASIC"].update(change)
+        sap_auth.destination_service()._cache.clear()
+        calls.clear()
+        tool("list_company_codes")(ctx=None)
+        assert {c["host"] for c in odata_calls(calls)} == {"other-api.s4hana.cloud.sap"}  # fetched again
 
 
 def test_destination_change_during_a_call_fails_instead_of_resending(monkeypatch):
@@ -401,12 +432,7 @@ def test_user_token_mode_forwards_the_signed_in_token(tool, calls, as_user, monk
 
 def test_sap_user_token_verifier_asks_sap_and_caches(monkeypatch):
     seen = []
-
-    def fake_get(url, headers=None, **kw):
-        seen.append(headers["Authorization"])
-        return Resp(200 if headers["Authorization"] == "Bearer good" else 401, None)
-
-    monkeypatch.setattr(inbound_auth.requests, "get", fake_get)
+    monkeypatch.setattr(inbound_auth.requests, "get", sap_checks({"good"}, seen))
     v = inbound_auth.SapUserTokenVerifier()
     assert asyncio.run(v.verify_token("good")).claims == {"s4hc_sap_user_token": True}
     assert asyncio.run(v.verify_token("good")) is not None
@@ -419,12 +445,7 @@ def test_sap_user_token_verifier_asks_sap_and_caches(monkeypatch):
 def test_sap_user_token_checks_are_bounded(monkeypatch):
     """Unauthenticated callers cannot use this server to drive unbounded traffic at SAP."""
     seen = []
-
-    def fake_get(url, headers=None, **kw):
-        seen.append(headers["Authorization"])
-        return Resp(200 if headers["Authorization"] == "Bearer good" else 401, None)
-
-    monkeypatch.setattr(inbound_auth.requests, "get", fake_get)
+    monkeypatch.setattr(inbound_auth.requests, "get", sap_checks({"good"}, seen))
     monkeypatch.setenv("S4HC_SAP_TOKEN_CHECKS_PER_MIN", "3")
     v = inbound_auth.SapUserTokenVerifier()
     assert asyncio.run(v.verify_token("good")) is not None
@@ -432,6 +453,53 @@ def test_sap_user_token_checks_are_bounded(monkeypatch):
         assert asyncio.run(v.verify_token(f"guess-{i}")) is None
     assert len(seen) == 3  # one accepted token + two guesses; the rest refused without asking SAP
     assert asyncio.run(v.verify_token("good")) is not None  # an accepted token keeps working from the cache
+
+
+def test_a_flood_of_invented_tokens_never_logs_out_a_signed_in_user(monkeypatch):
+    accepted, seen = {"good"}, []
+    monkeypatch.setattr(inbound_auth.requests, "get", sap_checks(accepted, seen))
+    monkeypatch.setenv("S4HC_SAP_TOKEN_CHECKS_PER_MIN", "3")
+    v = inbound_auth.SapUserTokenVerifier()
+    assert asyncio.run(v.verify_token("good")) is not None
+    for i in range(10):
+        asyncio.run(v.verify_token(f"guess-{i}"))  # budget used up by strangers
+    for k in v._ok:
+        v._ok[k] = 0.0  # the accepted entry's 5 minutes are over
+    n = len(seen)
+    assert asyncio.run(v.verify_token("good")) is not None and len(seen) == n + 1  # re-checked with SAP anyway
+    accepted.discard("good")  # SAP revokes it
+    for k in v._ok:
+        v._ok[k] = 0.0
+    assert asyncio.run(v.verify_token("good")) is None
+    assert asyncio.run(v.verify_token("good")) is None and len(seen) == n + 2  # the revocation is cached
+
+
+def test_each_sap_user_token_is_its_own_session_principal(monkeypatch):
+    from mcp.server.auth.provider import principal_components
+    monkeypatch.setattr(inbound_auth.requests, "get", sap_checks({"token-a", "token-b"}, []))
+    v = inbound_auth.SapUserTokenVerifier()
+    a, b = asyncio.run(v.verify_token("token-a")), asyncio.run(v.verify_token("token-b"))
+    assert principal_components(a) != principal_components(b)
+    assert principal_components(a) == principal_components(asyncio.run(v.verify_token("token-a")))
+    assert "token-a" not in a.subject
+
+
+def test_netrc_never_replaces_header_credentials(tmp_path, monkeypatch, as_user):
+    """requests swaps in ~/.netrc credentials when a request carries no auth object."""
+    import requests as _rq
+    netrc = tmp_path / "netrc"
+    netrc.write_text(f"default login shared password {RUN['basic_pw']}\n")
+    netrc.chmod(0o600)
+    monkeypatch.setenv("NETRC", str(netrc))
+    assert bearer_sent("https://my-api.s4hana.cloud.sap/x").startswith("Basic ")  # the trap is real
+    monkeypatch.setenv("S4HC_SAP_AUTH", "user_token")
+    as_user(AccessToken(token="s4-opaque-alice", client_id="s4hana-oauth", scopes=[],
+                        claims={"s4hc_sap_user_token": True}))
+    client = dependencies.get_client(None)
+    prepared = client.session.prepare_request(_rq.Request("GET", f"{client.base_url}/sap/opu/odata/sap/X"))
+    assert prepared.headers["Authorization"] == "Bearer s4-opaque-alice"
+    monkeypatch.setattr(inbound_auth.requests, "get", sap_checks({"good"}, []))
+    assert asyncio.run(inbound_auth.SapUserTokenVerifier().verify_token("bad")) is None
 
 
 def test_sap_user_token_unreachable_sap_is_not_cached_as_refused(monkeypatch):

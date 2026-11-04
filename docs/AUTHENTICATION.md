@@ -160,7 +160,11 @@ itself and an RFC 8414 document describing S/4HANA's endpoints (S/4HANA publishe
 token with one `$metadata` read, then forwards it. These checks happen before the caller is
 authenticated, so they are bounded: accepted tokens are cached 5 minutes, refused ones 1 minute, and at
 most `S4HC_SAP_TOKEN_CHECKS_PER_MIN` (default 60) new tokens are checked per minute, 8 at a time; over that,
-a new token gets `401` without SAP being asked. Set `S4HC_SAP_AUTH=user_token`, `S4HC_PUBLIC_URL`,
+a new token gets `401` without SAP being asked. A token SAP has accepted is re-checked every 5 minutes
+outside that budget, so a flood of invented tokens can delay new sign-ins but never logs out a signed-in
+user. There is no per-client limit: behind GenAI Studio or an ingress every caller has the same peer
+address, and `X-Forwarded-For` is set by the caller. Each token is its own MCP session principal, so a
+session opened by one user cannot be used with another user's token. Set `S4HC_SAP_AUTH=user_token`, `S4HC_PUBLIC_URL`,
 `S4HC_SAP_OAUTH_SCOPES` (the arrangement's OAuth scopes), optional `S4HC_SAP_OAUTH_AUTHORIZE_URL`
 (default `https://<tenant>.s4hana.cloud.sap/sap/bc/sec/oauth2/authorize` — present on Gamma) and
 `S4HC_SAP_OAUTH_PKCE` (default true; verify the tenant supports PKCE). S/4HANA tokens are opaque, so this

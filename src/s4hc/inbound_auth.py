@@ -36,6 +36,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from . import config
+from .client import HeaderAuth
 from .errors import S4HCError
 from .governance import _TokenBucket
 
@@ -110,10 +111,14 @@ class SapUserTokenVerifier(TokenVerifier):
     S/4HANA itself: a $metadata read with the token must succeed. Results are cached
     per token (keyed by HMAC, never the token itself): accepted ones for
     SAP_TOKEN_CHECK_TTL, refused ones for SAP_TOKEN_REFUSED_TTL. Checks run before
-    any other limit applies (the caller is not authenticated yet), so the ones that
-    miss the cache are bounded: S4HC_SAP_TOKEN_CHECKS_PER_MIN across all callers and
-    SAP_TOKEN_CHECK_CONCURRENCY at a time. Over the bound a token is refused (401)
-    without asking SAP; tokens already accepted keep working from the cache."""
+    any other limit applies (the caller is not authenticated yet), so checks of
+    tokens SAP has never accepted are bounded: SAP_TOKEN_CHECK_CONCURRENCY at a time
+    and S4HC_SAP_TOKEN_CHECKS_PER_MIN across all callers; over that a new token is
+    refused (401) without asking SAP. A token SAP accepted before is re-checked
+    outside that budget, which invented tokens can drain: a flood can delay new
+    sign-ins but never log out a signed-in user. There is no per-client bound: the
+    peer address is the ingress or GenAI Studio's proxy, and X-Forwarded-For is set
+    by the caller."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -128,7 +133,8 @@ class SapUserTokenVerifier(TokenVerifier):
         base = config.get_base_url(None)
         try:
             r = requests.get(f"{base}{config.JOURNAL_ITEM_SERVICE}/$metadata", timeout=15, allow_redirects=False,
-                             headers={"Authorization": f"Bearer {token}", "Accept": "application/xml"}, stream=True)
+                             headers={"Accept": "application/xml"}, stream=True,
+                             auth=HeaderAuth(lambda: {"Authorization": f"Bearer {token}"}))  # never ~/.netrc's
             r.close()
         except requests.RequestException:
             return None
@@ -152,21 +158,32 @@ class SapUserTokenVerifier(TokenVerifier):
             ok_until, refused_until = self._ok.get(k), self._refused.get(k)
         if refused_until and refused_until > now:
             return None
-        if not ok_until or ok_until < now:
-            if not self._checks.allow() or not self._in_flight.acquire(blocking=False):
-                log.warning("S/4HANA token check refused without asking SAP: check budget or concurrency exhausted")
+        if ok_until is None:  # never accepted: bounded, shared with every unknown caller
+            if not self._in_flight.acquire(blocking=False):
+                log.warning("S/4HANA token check refused without asking SAP: too many checks in flight")
                 return None
             try:
+                if not self._checks.allow():
+                    log.warning("S/4HANA token check refused without asking SAP: per-minute budget used up")
+                    return None
                 ok = await anyio.to_thread.run_sync(self._check, token)
             finally:
                 self._in_flight.release()
-            if ok is False:
-                self._remember(self._refused, k, now + SAP_TOKEN_REFUSED_TTL)
-            if not ok:
-                return None
+        elif ok_until < now:  # accepted before: re-checked outside the budget strangers can drain
+            ok = await anyio.to_thread.run_sync(self._check, token)
+        else:
+            ok = True
+        if ok is False:
+            with self._lock:
+                self._ok.pop(k, None)
+            self._remember(self._refused, k, now + SAP_TOKEN_REFUSED_TTL)
+        if not ok:
+            return None
+        if ok_until is None or ok_until < now:
             self._remember(self._ok, k, now + SAP_TOKEN_CHECK_TTL)
+        # A per-token subject, so the MCP SDK binds each session to the user who opened it.
         return AccessToken(token=token, client_id="s4hana-oauth", scopes=[], expires_at=None,
-                           claims={"s4hc_sap_user_token": True})
+                           subject="sap-token:" + k[:32], claims={"s4hc_sap_user_token": True})
 
 
 class SapOAuthProvider(RemoteAuthProvider):

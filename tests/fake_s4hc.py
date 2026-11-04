@@ -14,6 +14,10 @@ from collections import defaultdict
 from decimal import Decimal
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
+from requests import PreparedRequest
+from requests.auth import AuthBase
+from requests.structures import CaseInsensitiveDict
+
 NINES = "/Date(253402214400000)/"  # 9999-12-31
 
 COST_CENTERS = [
@@ -230,9 +234,14 @@ def fake_get(self, url, params=None, headers=None, timeout=None, **kwargs):
     q = {k: unquote(v[0]) for k, v in parse_qs(u.query).items()}
     q.update(params or {})
     sent = {**dict(getattr(self, "headers", {}) or {}), **(headers or {})}
-    CALLS.append({"path": u.path, "params": dict(q), "auth": getattr(self, "auth", None), "host": u.netloc,
+    auth = getattr(self, "auth", None)
+    if isinstance(auth, AuthBase):  # what requests does in prepare_auth: header-borne credentials
+        prepared = PreparedRequest()
+        prepared.headers = CaseInsensitiveDict(sent)
+        sent, auth = dict(auth(prepared).headers), None
+    CALLS.append({"path": u.path, "params": dict(q), "auth": auth, "host": u.netloc,
                   "scheme": u.scheme, "headers": sent, "proxies": dict(getattr(self, "proxies", {}) or {})})
-    if STATE.get("valid_bearers") is not None and getattr(self, "auth", None) is None:
+    if STATE.get("valid_bearers") is not None and auth is None:
         bearer = str(sent.get("Authorization", ""))
         if not bearer.startswith("Bearer ") or bearer[7:] not in STATE["valid_bearers"]:
             return FakeResp(401, {"error": {"message": {"value": "Unauthorized"}}})

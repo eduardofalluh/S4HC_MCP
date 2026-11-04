@@ -254,14 +254,23 @@ def build_client(conn: Connection, *, timeout: int = 60, retries: int = 3,
                       auth_headers=conn.headers, timeout=timeout, retries=retries, on_verified=on_verified)
 
 
+def _route(conn: Connection) -> str:
+    """Where a destination-based connection points right now (host, proxy, sap-client),
+    for cache keys: a re-pointed destination gets its own client and its own cached
+    master data. Empty for other connections. Not network-free (a cached lookup), so
+    it is never called from resolve_connection()."""
+    if conn.target is None:
+        return ""
+    t = conn.target()
+    return f"|{t.base_url}|{t.proxy_url or ''}|{t.sap_client or ''}"
+
+
 def get_client(ctx: Context | None = None) -> S4HCClient:
     conn = resolve_connection(ctx)
-    fp = key = conn.fingerprint
+    fp = conn.fingerprint
     if conn.per_call:  # bound to this request's user token: never reused for another call
         return build_client(conn, on_verified=lambda: mark_verified(fp))
-    if conn.target is not None:  # the destination picks host and proxy: a changed one gets its own client
-        t = conn.target()
-        key = f"{fp}|{t.base_url}|{t.proxy_url or ''}"
+    key = fp + _route(conn)
     with _lock:
         client = _cached.get(key)
         if client is not None:
@@ -319,7 +328,8 @@ def cached(ctx: Context | None, key: str, loader: Callable[[], Any]) -> Any:
     from .governance import get_scope
 
     sc = get_scope(ctx)
-    k = f"{resolve_connection(ctx).fingerprint}|{sorted(sc.company_codes)}|{sorted(sc.cost_centers)}|{key}"
+    conn = resolve_connection(ctx)
+    k = f"{conn.fingerprint}{_route(conn)}|{sorted(sc.company_codes)}|{sorted(sc.cost_centers)}|{key}"
     now = time.time()
     with _lock:
         hit = _master_cache.get(k)

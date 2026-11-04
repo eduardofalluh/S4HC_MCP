@@ -18,6 +18,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Iterable
 
 import requests
+from requests.auth import AuthBase
 
 from . import config
 from .errors import S4HCError
@@ -159,6 +160,20 @@ def _read_capped(r: Any) -> Any:
     return r
 
 
+class HeaderAuth(AuthBase):
+    """Adds the credential headers of a token mode to each request (called per
+    request, so tokens refresh in place). It must be the request's or session's
+    auth: requests replaces the Authorization header with ~/.netrc credentials
+    whenever neither carries an auth object."""
+
+    def __init__(self, headers: Callable[[], dict[str, str]]) -> None:
+        self._headers = headers
+
+    def __call__(self, r: requests.PreparedRequest) -> requests.PreparedRequest:
+        r.headers.update(self._headers())
+        return r
+
+
 class S4HCClient:
     def __init__(
         self,
@@ -174,7 +189,6 @@ class S4HCClient:
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._on_verified = on_verified
-        self._auth_headers = auth_headers  # called per request, so tokens refresh in place
         self.timeout = timeout
         self.retries = retries
         self.session = requests.Session()
@@ -182,7 +196,9 @@ class S4HCClient:
             self.session.cert = cert
         elif user and password:
             self.session.auth = (user, password)
-        elif auth_headers is None:
+        elif auth_headers is not None:
+            self.session.auth = HeaderAuth(auth_headers)
+        else:
             raise S4HCError(
                 "No credentials: set S4HC_USER + S4HC_PASSWORD, S4HC_CLIENT_CERT(_PEM) or an S4HC_SAP_AUTH token mode",
                 "NOT_CONFIGURED"
@@ -203,8 +219,7 @@ class S4HCClient:
             if remaining <= 0:
                 break
             try:
-                headers = {"Accept": accept, **(self._auth_headers() if self._auth_headers else {})}
-                r = self.session.get(url, params=params, headers=headers,
+                r = self.session.get(url, params=params, headers={"Accept": accept},
                                      timeout=min(self.timeout, remaining), allow_redirects=False, stream=True)
             except requests.RequestException as exc:
                 last_exc = exc
