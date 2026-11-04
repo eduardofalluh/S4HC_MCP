@@ -16,6 +16,7 @@ os.environ.update({
     "S4HC_BASE_URL": "https://my-api.s4hana.cloud.sap",
     "S4HC_USER": TEST_USER, "S4HC_PASSWORD": TEST_PASSWORD,
     "S4HC_PAGE_SIZE": "2",
+    "NETRC": os.devnull,  # the developer's ~/.netrc must not leak into requests made by the tests
 })
 
 import asyncio  # noqa: E402

@@ -38,6 +38,7 @@ from urllib.parse import quote, urlsplit
 
 import requests
 
+from .client import HeaderAuth
 from .errors import S4HCError
 
 log = logging.getLogger("s4hc-mcp.sap-auth")
@@ -266,11 +267,13 @@ class DestinationService:
 
     def _lookup(self, name: str, user_jwt: str | None) -> SapTarget:
         url = f"{self.binding.service_url}/destination-configuration/v1/destinations/{quote(name, safe='')}"
-        headers = {"Authorization": f"Bearer {self._token()}", "Accept": "application/json"}
+        service_token = self._token()
+        headers = {"Accept": "application/json"}
         if user_jwt:
             headers["X-User-Token"] = user_jwt
         try:
-            r = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT, allow_redirects=False)
+            r = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT, allow_redirects=False,
+                             auth=HeaderAuth(lambda: {"Authorization": f"Bearer {service_token}"}))  # never ~/.netrc's
         except requests.RequestException as exc:
             raise S4HCError(f"BTP Destination service unreachable ({exc.__class__.__name__})", "SAP_UNAVAILABLE") from exc
         if r.status_code == 404:

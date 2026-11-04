@@ -95,7 +95,7 @@ class FakeBTP:
         name = url.rsplit("/", 1)[1]
         user = headers.get("X-User-Token")
         self.lookups.append({"name": name, "user": user})
-        if headers.get("Authorization") != "Bearer dest-svc-token":
+        if bearer_sent(url, headers, **kw) != "Bearer dest-svc-token":
             return Resp(401, {"error": "unauthorized"})
         if name not in self.destinations:
             return Resp(404, {"ErrorMessage": "not found"})
@@ -463,15 +463,79 @@ def test_a_flood_of_invented_tokens_never_logs_out_a_signed_in_user(monkeypatch)
     assert asyncio.run(v.verify_token("good")) is not None
     for i in range(10):
         asyncio.run(v.verify_token(f"guess-{i}"))  # budget used up by strangers
-    for k in v._ok:
-        v._ok[k] = 0.0  # the accepted entry's 5 minutes are over
+    age(v, inbound_auth.SAP_TOKEN_CHECK_TTL + 1)  # the accepted entry's 5 minutes are over
     n = len(seen)
     assert asyncio.run(v.verify_token("good")) is not None and len(seen) == n + 1  # re-checked with SAP anyway
     accepted.discard("good")  # SAP revokes it
-    for k in v._ok:
-        v._ok[k] = 0.0
+    age(v, inbound_auth.SAP_TOKEN_CHECK_TTL + 1)
     assert asyncio.run(v.verify_token("good")) is None
     assert asyncio.run(v.verify_token("good")) is None and len(seen) == n + 2  # the revocation is cached
+
+
+def age(v, seconds):
+    """Pretend SAP last confirmed every accepted token `seconds` ago."""
+    for k in v._ok:
+        v._ok[k] = (time.time() - seconds, 0.0)
+
+
+def test_one_recheck_per_token_however_many_requests_arrive(monkeypatch):
+    seen = []
+    check = sap_checks({"good"}, seen)
+
+    def slow_get(url, headers=None, **kw):
+        time.sleep(0.2)  # SAP answering slowly: the other requests arrive meanwhile
+        return check(url, headers, **kw)
+
+    monkeypatch.setattr(inbound_auth.requests, "get", slow_get)
+    v = inbound_auth.SapUserTokenVerifier()
+    assert asyncio.run(v.verify_token("good")) is not None
+    age(v, inbound_auth.SAP_TOKEN_CHECK_TTL + 1)
+
+    async def burst():
+        return await asyncio.gather(*(v.verify_token("good") for _ in range(50)))
+    assert all(t is not None for t in asyncio.run(burst()))  # served from the just-expired entry
+    assert len(seen) == 2  # the first check plus one re-check, not 50
+
+
+def test_recheck_backs_off_when_sap_does_not_answer(monkeypatch):
+    answers = []
+
+    def fake_get(url, headers=None, **kw):
+        answers.append(1)
+        return Resp(200 if len(answers) == 1 else 503, None)
+
+    monkeypatch.setattr(inbound_auth.requests, "get", fake_get)
+    v = inbound_auth.SapUserTokenVerifier()
+    assert asyncio.run(v.verify_token("good")) is not None
+    age(v, inbound_auth.SAP_TOKEN_CHECK_TTL + 1)
+    assert asyncio.run(v.verify_token("good")) is not None  # SAP down: still within the unconfirmed limit
+    assert asyncio.run(v.verify_token("good")) is not None and len(answers) == 2  # backing off, not re-asking
+    age(v, inbound_auth.SAP_TOKEN_MAX_UNCONFIRMED + 1)
+    assert asyncio.run(v.verify_token("good")) is None  # unconfirmed for too long
+
+
+def test_one_sender_cannot_use_up_the_token_check_budget_for_others(monkeypatch):
+    seen, sender = [], {"addr": "203.0.113.9"}
+    monkeypatch.setattr(inbound_auth.requests, "get", sap_checks({"valid-new"}, seen))
+    monkeypatch.setattr(inbound_auth, "_request_source", lambda hops: sender["addr"])
+    monkeypatch.setenv("S4HC_SAP_TOKEN_CHECKS_PER_SOURCE_PER_MIN", "2")
+    v = inbound_auth.SapUserTokenVerifier()
+    for i in range(20):
+        asyncio.run(v.verify_token(f"guess-{i}"))
+    assert len(seen) == 2  # the flooding sender's share
+    sender["addr"] = "198.51.100.7"  # GenAI Studio's egress, say
+    assert asyncio.run(v.verify_token("valid-new")) is not None
+
+
+@pytest.mark.parametrize("peer,xff,hops,expected", [
+    ("10.0.0.5", "", 0, "10.0.0.5"),
+    ("10.0.0.5", "6.6.6.6, 203.0.113.9", 0, "10.0.0.5"),  # no trusted proxy: the header is ignored
+    ("10.0.0.5", "6.6.6.6, 203.0.113.9", 1, "203.0.113.9"),  # appended by the trusted ingress; 6.6.6.6 is forged
+    ("10.0.0.5", "6.6.6.6, 203.0.113.9, 10.0.0.9", 2, "203.0.113.9"),
+    ("10.0.0.5", "203.0.113.9", 2, "10.0.0.5"),  # shorter chain than configured: did not come through the proxies
+])
+def test_token_check_sender_is_taken_from_trusted_proxies_only(peer, xff, hops, expected):
+    assert inbound_auth._source_of(peer, xff, hops) == expected
 
 
 def test_each_sap_user_token_is_its_own_session_principal(monkeypatch):
@@ -484,7 +548,7 @@ def test_each_sap_user_token_is_its_own_session_principal(monkeypatch):
     assert "token-a" not in a.subject
 
 
-def test_netrc_never_replaces_header_credentials(tmp_path, monkeypatch, as_user):
+def test_netrc_never_replaces_header_credentials(tmp_path, monkeypatch, as_user, btp):
     """requests swaps in ~/.netrc credentials when a request carries no auth object."""
     import requests as _rq
     netrc = tmp_path / "netrc"
@@ -498,6 +562,7 @@ def test_netrc_never_replaces_header_credentials(tmp_path, monkeypatch, as_user)
     client = dependencies.get_client(None)
     prepared = client.session.prepare_request(_rq.Request("GET", f"{client.base_url}/sap/opu/odata/sap/X"))
     assert prepared.headers["Authorization"] == "Bearer s4-opaque-alice"
+    assert sap_auth.destination_service().resolve("S4_TECH_BASIC").base_url  # the lookup's Bearer survives too
     monkeypatch.setattr(inbound_auth.requests, "get", sap_checks({"good"}, []))
     assert asyncio.run(inbound_auth.SapUserTokenVerifier().verify_token("bad")) is None
 

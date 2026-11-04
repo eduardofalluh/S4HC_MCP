@@ -26,6 +26,7 @@ import secrets
 import threading
 import time
 from collections import OrderedDict
+from typing import Any
 
 import anyio
 import requests
@@ -42,9 +43,12 @@ from .governance import _TokenBucket
 
 CLOCK_SKEW_SECONDS = 60
 SAP_TOKEN_CHECK_TTL = 300
+SAP_TOKEN_MAX_UNCONFIRMED = 600
+SAP_TOKEN_RETRY_SECONDS = 30
 SAP_TOKEN_REFUSED_TTL = 60
 SAP_TOKEN_CHECK_CONCURRENCY = 8
 MAX_CHECKED_SAP_TOKENS = 4096
+MAX_TOKEN_CHECK_SOURCES = 1024
 _KEY = secrets.token_bytes(32)
 
 log = logging.getLogger("s4hc-mcp.inbound-auth")
@@ -106,27 +110,62 @@ class ApiKeyOrVerifier(TokenVerifier):
         return await self.inner.verify_token(token)
 
 
+def _source_of(peer: str, forwarded_for: str, trusted_hops: int) -> str:
+    """The request's sender, as far as it can be trusted. With N trusted proxies in
+    front, the last N X-Forwarded-For entries were appended by them, and the entry the
+    outermost one appended is the address it saw; entries left of it are set by the
+    caller. Without trusted proxies (or a shorter chain) it is the peer address."""
+    if trusted_hops > 0:
+        chain = [p.strip() for p in forwarded_for.split(",") if p.strip()]
+        if len(chain) >= trusted_hops:
+            return chain[-trusted_hops]
+    return peer
+
+
+def _request_source(trusted_hops: int) -> str:
+    try:
+        from fastmcp.server.dependencies import get_http_request
+        request = get_http_request()  # set by FastMCP's outermost middleware, so available during auth
+    except Exception:  # noqa: BLE001 - no HTTP request (stdio, unit tests)
+        return "-"
+    peer = request.client.host if request.client else "-"
+    return _source_of(peer, request.headers.get("x-forwarded-for", ""), trusted_hops)
+
+
 class SapUserTokenVerifier(TokenVerifier):
     """S/4HANA access tokens are opaque, so the only authority that can check one is
     S/4HANA itself: a $metadata read with the token must succeed. Results are cached
-    per token (keyed by HMAC, never the token itself): accepted ones for
-    SAP_TOKEN_CHECK_TTL, refused ones for SAP_TOKEN_REFUSED_TTL. Checks run before
-    any other limit applies (the caller is not authenticated yet), so checks of
-    tokens SAP has never accepted are bounded: SAP_TOKEN_CHECK_CONCURRENCY at a time
-    and S4HC_SAP_TOKEN_CHECKS_PER_MIN across all callers; over that a new token is
-    refused (401) without asking SAP. A token SAP accepted before is re-checked
-    outside that budget, which invented tokens can drain: a flood can delay new
-    sign-ins but never log out a signed-in user. There is no per-client bound: the
-    peer address is the ingress or GenAI Studio's proxy, and X-Forwarded-For is set
-    by the caller."""
+    per token (keyed by HMAC, never the token itself). Checks run before the caller
+    is authenticated, so every path to SAP is bounded:
+
+    * A token SAP has never accepted: SAP_TOKEN_CHECK_CONCURRENCY at a time, at most
+      S4HC_SAP_TOKEN_CHECKS_PER_SOURCE_PER_MIN per sender (see _source_of and
+      S4HC_TRUSTED_PROXY_HOPS) and S4HC_SAP_TOKEN_CHECKS_PER_MIN in all; over that it
+      is refused (401) without asking SAP. One sender cannot use up the budget for
+      the others; a flood from many senders can still delay sign-ins and token
+      refreshes (a refreshed token is a new token).
+    * A token SAP accepted: trusted for SAP_TOKEN_CHECK_TTL, then re-checked outside
+      that budget, one check per token at a time and SAP_TOKEN_CHECK_CONCURRENCY in
+      all. While a re-check is running or cannot run, or SAP gives no answer (retried
+      after SAP_TOKEN_RETRY_SECONDS), the token stays accepted until
+      SAP_TOKEN_MAX_UNCONFIRMED after SAP last confirmed it. Only SAP refusing it
+      revokes it.
+
+    Token checks therefore never hold more than 2 x SAP_TOKEN_CHECK_CONCURRENCY of
+    the worker threads that tool calls run on."""
 
     def __init__(self) -> None:
         super().__init__()
-        self._ok: OrderedDict[str, float] = OrderedDict()
+        self._ok: OrderedDict[str, tuple[float, float]] = OrderedDict()  # (confirmed_at, retry_at)
         self._refused: OrderedDict[str, float] = OrderedDict()
         self._lock = threading.Lock()
         self._checks = _TokenBucket(int(os.getenv("S4HC_SAP_TOKEN_CHECKS_PER_MIN", "60")))
+        self._per_source = int(os.getenv("S4HC_SAP_TOKEN_CHECKS_PER_SOURCE_PER_MIN", "20"))
+        self._trusted_hops = int(os.getenv("S4HC_TRUSTED_PROXY_HOPS", "0"))
+        self._sources: OrderedDict[str, _TokenBucket] = OrderedDict()
         self._in_flight = threading.BoundedSemaphore(SAP_TOKEN_CHECK_CONCURRENCY)
+        self._rechecks = threading.BoundedSemaphore(SAP_TOKEN_CHECK_CONCURRENCY)
+        self._rechecking: set[str] = set()
 
     def _check(self, token: str) -> bool | None:
         """True: SAP accepted the token. False: SAP refused it. None: no answer."""
@@ -142,12 +181,60 @@ class SapUserTokenVerifier(TokenVerifier):
             return True
         return False if r.status_code in (401, 403) else None
 
-    def _remember(self, cache: OrderedDict[str, float], k: str, until: float) -> None:
+    def _remember(self, cache: OrderedDict, k: str, value: Any) -> None:
         with self._lock:
-            cache[k] = until
+            cache[k] = value
             cache.move_to_end(k)
             while len(cache) > MAX_CHECKED_SAP_TOKENS:
                 cache.popitem(last=False)
+
+    def _source_bucket(self, source: str) -> _TokenBucket:
+        with self._lock:
+            b = self._sources.get(source)
+            if b is None:
+                b = self._sources[source] = _TokenBucket(self._per_source)
+                while len(self._sources) > MAX_TOKEN_CHECK_SOURCES:
+                    self._sources.popitem(last=False)
+            else:
+                self._sources.move_to_end(source)
+            return b
+
+    async def _first_check(self, token: str) -> bool | None:
+        source = _request_source(self._trusted_hops)
+        if not self._in_flight.acquire(blocking=False):
+            log.warning("S/4HANA token check refused without asking SAP: too many checks in flight")
+            return None
+        try:
+            # The sender's own share first, so a sender over it does not use up the shared budget.
+            if not self._source_bucket(source).allow() or not self._checks.allow():
+                log.warning("S/4HANA token check refused without asking SAP: per-minute budget used up")
+                return None
+            return await anyio.to_thread.run_sync(self._check, token)
+        finally:
+            self._in_flight.release()
+
+    async def _recheck(self, token: str, k: str, retry_at: float, now: float) -> bool | None:
+        """None when no check ran (one is running, no slot, back-off) or SAP gave no answer."""
+        with self._lock:
+            if k in self._rechecking or now < retry_at or not self._rechecks.acquire(blocking=False):
+                return None
+            self._rechecking.add(k)
+        try:
+            ok = await anyio.to_thread.run_sync(self._check, token)
+        finally:
+            with self._lock:
+                self._rechecking.discard(k)
+            self._rechecks.release()
+        if ok is None:
+            with self._lock:
+                if k in self._ok:
+                    self._ok[k] = (self._ok[k][0], time.time() + SAP_TOKEN_RETRY_SECONDS)
+        return ok
+
+    def _accepted(self, token: str, k: str) -> AccessToken:
+        # A per-token subject, so the MCP SDK binds each session to the user who opened it.
+        return AccessToken(token=token, client_id="s4hana-oauth", scopes=[], expires_at=None,
+                           subject="sap-token:" + k[:32], claims={"s4hc_sap_user_token": True})
 
     async def verify_token(self, token: str) -> AccessToken | None:
         if not token or len(token) > 8192:
@@ -155,35 +242,26 @@ class SapUserTokenVerifier(TokenVerifier):
         k = hmac.new(_KEY, token.encode(), hashlib.sha256).hexdigest()
         now = time.time()
         with self._lock:
-            ok_until, refused_until = self._ok.get(k), self._refused.get(k)
+            entry, refused_until = self._ok.get(k), self._refused.get(k)
         if refused_until and refused_until > now:
             return None
-        if ok_until is None:  # never accepted: bounded, shared with every unknown caller
-            if not self._in_flight.acquire(blocking=False):
-                log.warning("S/4HANA token check refused without asking SAP: too many checks in flight")
-                return None
-            try:
-                if not self._checks.allow():
-                    log.warning("S/4HANA token check refused without asking SAP: per-minute budget used up")
-                    return None
-                ok = await anyio.to_thread.run_sync(self._check, token)
-            finally:
-                self._in_flight.release()
-        elif ok_until < now:  # accepted before: re-checked outside the budget strangers can drain
-            ok = await anyio.to_thread.run_sync(self._check, token)
+        if entry is None:
+            ok = await self._first_check(token)
         else:
-            ok = True
+            confirmed_at, retry_at = entry
+            if now - confirmed_at < SAP_TOKEN_CHECK_TTL:
+                return self._accepted(token, k)
+            ok = await self._recheck(token, k, retry_at, now)
+            if ok is None:
+                return self._accepted(token, k) if now - confirmed_at < SAP_TOKEN_MAX_UNCONFIRMED else None
         if ok is False:
             with self._lock:
                 self._ok.pop(k, None)
             self._remember(self._refused, k, now + SAP_TOKEN_REFUSED_TTL)
         if not ok:
             return None
-        if ok_until is None or ok_until < now:
-            self._remember(self._ok, k, now + SAP_TOKEN_CHECK_TTL)
-        # A per-token subject, so the MCP SDK binds each session to the user who opened it.
-        return AccessToken(token=token, client_id="s4hana-oauth", scopes=[], expires_at=None,
-                           subject="sap-token:" + k[:32], claims={"s4hc_sap_user_token": True})
+        self._remember(self._ok, k, (now, 0.0))
+        return self._accepted(token, k)
 
 
 class SapOAuthProvider(RemoteAuthProvider):
