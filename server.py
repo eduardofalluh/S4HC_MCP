@@ -164,7 +164,7 @@ def _startup_check() -> None:
 
     info = connection_info(None)
     mode = (os.getenv("S4HC_SAP_AUTH") or "").strip().lower()
-    if info["auth_mode"] == "none" and mode not in ("", "basic", "x509"):
+    if info["auth_mode"] == "none" and mode not in ("", "basic"):
         log.warning("S4HC_SAP_AUTH=%s is not usable: %s", mode, info["base_url"])
     elif info["auth_mode"] == "none":
         log.warning("No S4HC_USER/S4HC_PASSWORD or client certificate set — expecting per-request x-s4hc-* headers.")
