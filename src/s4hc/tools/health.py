@@ -6,8 +6,8 @@ import time
 from fastmcp import Context, FastMCP
 
 from .. import config
-from ..client import S4HCClient, S4HCError
-from ..dependencies import connection_info, resolve_connection
+from ..client import S4HCError
+from ..dependencies import build_client, connection_info, resolve_connection
 from ..governance import get_scope
 
 # (name, service path, entity set read to prove data access, required, what it enables)
@@ -47,9 +47,7 @@ def register(mcp: FastMCP) -> None:
             return {"status": "configured" if info["auth_mode"] != "none" else "unconfigured",
                     "scope": scope_info, **info}
         try:
-            conn = resolve_connection(ctx)
-            client = S4HCClient(conn.base_url, user=conn.user, password=conn.password, cert=conn.cert,
-                                timeout=15, retries=0)
+            client = build_client(resolve_connection(ctx), timeout=15, retries=0)
         except S4HCError as exc:
             return {"status": "error", "error": str(exc), "scope": scope_info, **info}
         checks = {}

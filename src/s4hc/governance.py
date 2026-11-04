@@ -209,12 +209,15 @@ class AuditAndRateLimitMiddleware(Middleware):
         args = getattr(context.message, "arguments", None) or {}
         scope_args = {k: args[k] for k in SCOPE_ARG_KEYS if k in args and args[k] not in (None, [], "")}
         ctx = context.fastmcp_context
-        caller = None
-        try:
-            req = ctx.request_context.request  # type: ignore[union-attr]
-            caller = req.headers.get("x-user-email") or req.headers.get("x-s4hc-user")
-        except Exception:  # noqa: BLE001
-            pass
+        from .dependencies import caller_identity
+
+        caller = caller_identity(ctx)  # a verified token's subject wins over any header
+        if caller is None:
+            try:
+                req = ctx.request_context.request  # type: ignore[union-attr]
+                caller = req.headers.get("x-user-email") or req.headers.get("x-s4hc-user")
+            except Exception:  # noqa: BLE001
+                pass
         conn, trusted = rate_limit_key(ctx)
         if trusted:
             allowed = self._bucket(conn).allow() and self.global_bucket.allow()

@@ -13,7 +13,7 @@ shape as the sibling `CALM_MCP` repo.
 ## Commands
 
 - Install: `python -m venv venv && source venv/bin/activate && pip install -r requirements.txt`
-- Test: `python -m pytest tests -q` (112 tests: unit tests against a fake OData backend in `tests/fake_s4hc.py`, the review regression tests in `tests/test_review_fixes.py`, plus HTTP end-to-end tests in `tests/test_http_e2e.py` that spawn the real server process)
+- Test: `python -m pytest tests -q` (169 tests: unit tests against a fake OData backend in `tests/fake_s4hc.py`, the review regression tests in `tests/test_review_fixes.py`, OAuth / principal propagation in `tests/test_oauth.py` (faked BTP Destination + Connectivity services), plus HTTP end-to-end tests in `tests/test_http_e2e.py` that spawn the real server process)
 - Live check: `python scripts/live_smoke.py` runs all 16 tools against the tenant in `S4HC_*` (read-only; prints counts and totals, never rows or credentials)
 - Lint and type-check: none configured (no ruff/flake8/mypy/pyproject in the repo)
 - Run locally: `cp .env.example .env` (fill in `S4HC_BASE_URL` + credentials), then `python server.py` (stdio) or `python server.py --http --port 8000` (Streamable HTTP at `/mcp`)
@@ -25,6 +25,8 @@ shape as the sibling `CALM_MCP` repo.
 - `src/s4hc/config.py` — all configuration from env vars (no hard-coded tenant): service paths, field allowlists per entity, `NAME_FOR` (dimension → its name field), `PERSON_FIELDS`, base-URL validation (plain https origin on an SAP API domain), the inline-PEM cert cache.
 - `src/s4hc/client.py` — `S4HCClient`: GET-only OData V2 client. Basic/X.509 auth, never follows redirects, follows `__next` whenever present (else `$top/$skip`), asks for one row past the ceiling so `truncated` is exact, retry with backoff on 429/5xx honouring `Retry-After` (seconds or HTTP-date), one deadline per paged read, `/Date()/` → ISO.
 - `src/s4hc/dependencies.py` — resolves a `Connection` per call: header credentials (all three `x-s4hc-*` together) or the server's env credentials, never mixed. Client cache and master-data cache are LRU-bounded and keyed on a credential fingerprint plus the data scope.
+- `src/s4hc/inbound_auth.py` — hop 1 (AI client → MCP): builds the FastMCP auth provider: OIDC/JWT resource server (`StrictJWTVerifier`: requires `exp`/`sub`, checks `nbf`; `S4HC_MCP_API_KEY` stays accepted as a user-less bearer) or the CALM-style S/4HANA sign-in (`S4HC_SAP_AUTH=user_token`). None = old API-key middleware.
+- `src/s4hc/sap_auth.py` — hop 2 (MCP → S/4HANA) token sources: S/4HANA OAuth client credentials, BTP Destination service (all four ARC-1 credential shapes, per-user via `X-User-Token`), Connectivity proxy for OnPremise (jwt-bearer user exchange → `Proxy-Authorization`). See `docs/AUTHENTICATION.md`.
 - `src/s4hc/governance.py` — data-scope allowlists (env is a ceiling headers can only narrow; row post-filter fails closed), audit log, rate limits: trusted connections (env credentials, or credentials SAP answered 2xx for — `dependencies.mark_verified`) per connection + a global budget; unverified ones per connection + their own shared ceiling.
 - `src/s4hc/tools/` — one module per tool group, each with a `register(mcp)` called from `server.py`: `health` (`s4hc_health`: `$metadata` + one-row read per service), `master_data` (company codes, profit centers with names and company code assignment, G/L accounts with names), `cost_centers`, `actuals` (`get_cost_center_actuals`, `cost_center_summary` — shared helpers `fetch_actuals`/`build_filter`/`envelope`/`ensure_single_currency`/`pad_period` live here), `analysis` (breakdowns, period comparison, trend, CSV export, fiscal context), `postings` (G/L line items, fields validated against live `$metadata`), `plan` (actual vs. plan), `odata_read` (`describe_service` + the admin-only `s4hc_odata_read`).
 - Start reading at `server.py`, then `src/s4hc/tools/actuals.py`.
@@ -40,6 +42,9 @@ shape as the sibling `CALM_MCP` repo.
 - The client is strictly GET-only; there is no write path anywhere in `src/s4hc`, and that's intentional.
 
 ## Gotchas
+
+- `resolve_connection()` runs on every tool call (rate limit, cache keys), so it must stay network-free: token modes return a lazy `Connection.headers` / `Connection.target`, fetched only in `build_client()`. Per-user connections (`principal_propagation`, `user_token`) are never cached as clients.
+- Per-user modes are strict: no signed-in user (stdio, API key) → `UNAUTHORIZED_SCOPE`; never fall back to the communication user. Keep it that way (ARC-1's `SAP_PP_STRICT` rationale).
 
 - `A_JournalEntryItemBasic` and `A_FinPlanningEntryItem` are *aggregating* entities — SAP sums measures over whatever dimensions are in `$select`. They also hold every ledger line: without the cost center filter, a company code's total is ~0.
 - SAP returns `FiscalPeriod` and `LedgerFiscalYear` without leading zeros (`display-format="NonNegative"`); filters accept `'001'` or `'1'`. Use `pad_period` on anything that sorts or keys on periods.

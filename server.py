@@ -133,7 +133,11 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
-mcp = FastMCP("sap-s4hana-cloud")
+from src.s4hc.inbound_auth import build_auth_provider  # noqa: E402
+
+# OIDC resource server or S/4HANA OAuth sign-in when configured; None keeps the API-key / open modes.
+AUTH_PROVIDER = build_auth_provider()
+mcp = FastMCP("sap-s4hana-cloud", auth=AUTH_PROVIDER)
 
 # Audit log of every tool call + MCP-level rate limit (SAP ref-arch 137800 / API Policy §2.1)
 mcp.add_middleware(AuditAndRateLimitMiddleware())
@@ -146,6 +150,13 @@ analysis.register(mcp)       # fiscal_context, actuals_breakdown, compare_cost_c
 postings.register(mcp)       # get_cost_center_postings (API_GLACCOUNTLINEITEM, optional)
 plan.register(mcp)           # get_actual_vs_plan (API_FINPLANNINGENTRYITEM_SRV, optional)
 odata_read.register(mcp)     # describe_service, s4hc_odata_read
+
+
+def connection_info_mode() -> str:
+    from src.s4hc.dependencies import connection_info
+
+    info = connection_info(None)
+    return f"MCP={info['mcp_auth']} SAP={info['auth_mode']}"
 
 
 def _startup_check() -> None:
@@ -169,14 +180,18 @@ def main() -> None:
 
     if args.http:
         no_auth_ok = os.getenv("S4HC_MCP_ALLOW_UNAUTHENTICATED", "false").lower() in ("1", "true", "yes")
-        if not os.getenv("S4HC_MCP_API_KEY") and not _is_loopback(args.host) and not no_auth_ok:
+        if not (os.getenv("S4HC_MCP_API_KEY") or AUTH_PROVIDER) and not _is_loopback(args.host) and not no_auth_ok:
             log.error("Refusing to serve /mcp on %s without S4HC_MCP_API_KEY. Set the key, or set "
                       "S4HC_MCP_ALLOW_UNAUTHENTICATED=true if the platform authenticates callers.", args.host)
             sys.exit(2)
-        middleware = [Middleware(_OriginGuardMiddleware), Middleware(_InboundKeyMiddleware)]
+        middleware = [Middleware(_OriginGuardMiddleware)]
+        if AUTH_PROVIDER is None:  # with a provider, the API key is one of the accepted bearer tokens
+            middleware.append(Middleware(_InboundKeyMiddleware))
         if os.getenv("MCP_TRUST_PROXY", "true").lower() in ("1", "true", "yes"):
             middleware.append(Middleware(_TrustProxyMiddleware))
-        if os.getenv("S4HC_MCP_API_KEY"):
+        if AUTH_PROVIDER is not None:
+            log.info("OAuth required on /mcp (%s)", connection_info_mode())
+        elif os.getenv("S4HC_MCP_API_KEY"):
             log.info("Inbound API key required on /mcp")
         else:
             log.warning("S4HC_MCP_API_KEY not set — /mcp accepts any caller; rely on network/platform auth")

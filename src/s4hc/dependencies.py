@@ -22,7 +22,7 @@ import secrets
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from fastmcp import Context
@@ -80,18 +80,96 @@ class Connection:
     user: str | None
     password: str | None
     cert: str | tuple[str, str] | None
-    source: str  # "header" | "env"
+    source: str  # header | env | oauth2 | destination | principal_propagation | user_token
+    identity: str = ""  # non-secret identity, for sources whose credential is a token
+    headers: Callable[[], dict[str, str]] | None = field(default=None, compare=False, repr=False)
+    target: Callable[[], Any] | None = field(default=None, compare=False, repr=False)
+
+    @property
+    def per_call(self) -> bool:
+        """Credentials bound to one signed-in user's current token: never cached."""
+        return self.source in ("principal_propagation", "user_token")
 
     @property
     def fingerprint(self) -> str:
         """Stable, non-reversible identity of tenant + credential. Two callers
         share a cached client or cached result only if this matches."""
-        secret = self.password if self.password is not None else repr(self.cert)
-        raw = "\0".join([self.base_url, self.user or "", secret or ""])
+        if self.identity:
+            raw = "\0".join([self.source, self.base_url, self.identity])
+        else:
+            secret = self.password if self.password is not None else repr(self.cert)
+            raw = "\0".join([self.base_url, self.user or "", secret or ""])
         return hmac.new(_FINGERPRINT_KEY, raw.encode(), hashlib.sha256).hexdigest()[:32]
 
 
+def _access_token(ctx: Context | None):
+    """The caller's verified token (HTTP with an auth provider), or None."""
+    try:
+        from fastmcp.server.dependencies import get_access_token
+        return get_access_token()
+    except Exception:  # noqa: BLE001 - stdio / no auth provider
+        return None
+
+
+def caller_identity(ctx: Context | None) -> str | None:
+    """Audit identity of a signed-in caller: the token's subject, never a header."""
+    tok = _access_token(ctx)
+    claims = getattr(tok, "claims", None) or {}
+    if claims.get("sub") and not claims.get("s4hc_api_key"):
+        return "sub:" + str(claims["sub"])[:64]
+    if claims.get("s4hc_sap_user_token"):
+        return "sap-token:" + hmac.new(_FINGERPRINT_KEY, str(tok.token).encode(), hashlib.sha256).hexdigest()[:12]
+    if claims.get("s4hc_api_key"):
+        return "api-key"
+    return None
+
+
+def _user_connection(ctx: Context | None, mode: str) -> Connection:
+    """Principal propagation / SAP user token: the SAP identity is the signed-in user's,
+    so header credentials, a header base URL or an API-key caller are refused."""
+    if _header(ctx, HEADER_PREFIX + "user") or _header(ctx, HEADER_PREFIX + "password") \
+            or _header(ctx, HEADER_PREFIX + "base-url"):
+        raise S4HCError(f"S4HC_SAP_AUTH={mode}: the SAP identity comes from the user's sign-in; "
+                        "x-s4hc-base-url / x-s4hc-user / x-s4hc-password are not accepted", "UNAUTHORIZED_SCOPE")
+    tok = _access_token(ctx)
+    claims = getattr(tok, "claims", None) or {}
+    if mode == "user_token":
+        if not claims.get("s4hc_sap_user_token"):
+            raise S4HCError("This deployment runs every call as the signed-in S/4HANA user; sign in through the "
+                            "MCP client's OAuth flow (an API key carries no SAP user)", "UNAUTHORIZED_SCOPE")
+        token = str(tok.token)
+        return Connection(config.get_base_url(None), None, None, None, "user_token",
+                          identity=hashlib.sha256(token.encode()).hexdigest(),
+                          headers=lambda: {"Authorization": f"Bearer {token}"})
+    if not claims.get("sub") or claims.get("s4hc_api_key"):
+        raise S4HCError("Principal propagation runs every call as the signed-in user; this call has no user token "
+                        "(API keys and stdio carry no user). Nothing falls back to a shared SAP identity.",
+                        "UNAUTHORIZED_SCOPE")
+    dest = _destination_name()
+    user_jwt = str(tok.token)
+    from . import sap_auth
+    return Connection("", None, None, None, "principal_propagation",
+                      identity=f"{dest}|{claims.get('iss', '')}|{claims['sub']}",
+                      target=lambda: sap_auth.destination_service().resolve(dest, user_jwt=user_jwt))
+
+
+def _destination_name() -> str:
+    name = (os.getenv("S4HC_BTP_DESTINATION") or "").strip()
+    if not name:
+        raise S4HCError("S4HC_BTP_DESTINATION (the BTP destination name) is required for this S4HC_SAP_AUTH mode",
+                        "NOT_CONFIGURED")
+    return name
+
+
 def resolve_connection(ctx: Context | None = None) -> Connection:
+    """Who this call reaches SAP as. Cheap: no network. Token-based credentials are
+    fetched lazily (Connection.headers / Connection.target) when a client is built."""
+    from .inbound_auth import sap_auth_mode
+
+    mode = sap_auth_mode()
+    if mode in ("principal_propagation", "user_token"):
+        return _user_connection(ctx, mode)
+
     h_url = _header(ctx, HEADER_PREFIX + "base-url")
     h_user = _header(ctx, HEADER_PREFIX + "user")
     h_password = _header(ctx, HEADER_PREFIX + "password")
@@ -101,6 +179,15 @@ def resolve_connection(ctx: Context | None = None) -> Connection:
             raise S4HCError("x-s4hc-user and x-s4hc-password must be sent together", "NOT_CONFIGURED")
         return Connection(config.get_base_url(h_url), h_user, h_password, None, "header")
 
+    if mode == "destination":
+        if h_url:
+            raise S4HCError("S4HC_SAP_AUTH=destination: the SAP host comes from the BTP destination, "
+                            "x-s4hc-base-url is not accepted", "NOT_CONFIGURED")
+        dest = _destination_name()
+        from . import sap_auth
+        return Connection("", None, None, None, "destination", identity=dest,
+                          target=lambda: sap_auth.destination_service().resolve(dest))
+
     env_url = config.get_base_url(None) if os.getenv("S4HC_BASE_URL") else None
     if h_url:
         url = config.get_base_url(h_url)
@@ -109,6 +196,14 @@ def resolve_connection(ctx: Context | None = None) -> Connection:
                             "come with x-s4hc-user and x-s4hc-password; server credentials are never sent "
                             "to a caller-chosen host", "NOT_CONFIGURED")
     url = config.get_base_url(None)
+    if mode == "oauth2_client_credentials":
+        from . import sap_auth
+        cc = sap_auth.client_credentials_token(url)
+        return Connection(url, None, None, None, "oauth2", identity=f"{cc.token_url}|{cc.client_id}",
+                          headers=cc.headers)
+    if mode not in ("", "basic", "x509"):
+        raise S4HCError(f"Unknown S4HC_SAP_AUTH {mode!r}: use basic, x509, oauth2_client_credentials, destination, "
+                        "principal_propagation or user_token", "NOT_CONFIGURED")
     cert = config.resolve_client_cert()
     user, password = os.getenv("S4HC_USER"), os.getenv("S4HC_PASSWORD")
     if cert:
@@ -116,16 +211,30 @@ def resolve_connection(ctx: Context | None = None) -> Connection:
     return Connection(url, user, password, None, "env")
 
 
+def build_client(conn: Connection, *, timeout: int = 60, retries: int = 3,
+                 on_verified: Callable[[], None] | None = None) -> S4HCClient:
+    if conn.target is not None:
+        first = conn.target()
+        resolver = conn.target
+        return S4HCClient(first.base_url, user=first.basic[0] if first.basic else None,
+                          password=first.basic[1] if first.basic else None,
+                          auth_headers=lambda: dict(resolver().headers), proxy_url=first.proxy_url,
+                          sap_client=first.sap_client, timeout=timeout, retries=retries, on_verified=on_verified)
+    return S4HCClient(conn.base_url, user=conn.user, password=conn.password, cert=conn.cert,
+                      auth_headers=conn.headers, timeout=timeout, retries=retries, on_verified=on_verified)
+
+
 def get_client(ctx: Context | None = None) -> S4HCClient:
     conn = resolve_connection(ctx)
     key = conn.fingerprint
+    if conn.per_call:  # bound to this request's user token: never reused for another call
+        return build_client(conn, on_verified=lambda: mark_verified(key))
     with _lock:
         client = _cached.get(key)
         if client is not None:
             _cached.move_to_end(key)
             return client
-    client = S4HCClient(conn.base_url, user=conn.user, password=conn.password, cert=conn.cert,
-                        on_verified=lambda: mark_verified(key))
+    client = build_client(conn, on_verified=lambda: mark_verified(key))
     with _lock:
         _cached[key] = client
         while len(_cached) > MAX_CLIENTS:
@@ -157,7 +266,8 @@ def rate_limit_key(ctx: Context | None = None) -> tuple[str, bool]:
         conn = resolve_connection(ctx)
     except S4HCError:
         return "unresolved", False
-    if conn.source == "env":
+    # Server-configured identities, and users whose token this server verified itself.
+    if conn.source in ("env", "oauth2", "destination", "principal_propagation"):
         return conn.fingerprint, True
     with _lock:
         return conn.fingerprint, conn.fingerprint in _verified
@@ -188,21 +298,29 @@ def cached(ctx: Context | None, key: str, loader: Callable[[], Any]) -> Any:
 
 def connection_info(ctx: Context | None = None) -> dict[str, Any]:
     """Non-secret summary of how the connection is configured."""
+    from .inbound_auth import oidc_enabled, sap_auth_mode
+
+    modes = {"header": "header-basic", "oauth2": "oauth2-client-credentials", "destination": "btp-destination",
+             "principal_propagation": "principal-propagation", "user_token": "sap-user-token"}
     try:
         conn = resolve_connection(ctx)
-        base_url = conn.base_url
-        if conn.source == "header":
-            auth_mode = "header-basic"
+        base_url = conn.base_url or f"<from BTP destination {_destination_name()}>"
+        if conn.source in modes:
+            auth_mode = modes[conn.source]
         elif conn.cert:
             auth_mode = "x509"
         else:
             auth_mode = "basic" if conn.user and conn.password else "none"
     except S4HCError as exc:
-        base_url, auth_mode = f"<unset: {exc}>", "none"
+        base_url = f"<unset: {exc}>"
+        auth_mode = modes.get(sap_auth_mode().replace("oauth2_client_credentials", "oauth2"), "none")
     d = get_defaults(ctx)
+    mcp_auth = ("sap-oauth" if sap_auth_mode() == "user_token" else "oidc" if oidc_enabled()
+                else "api-key" if os.getenv("S4HC_MCP_API_KEY") else "none")
     return {
         "base_url": base_url,
         "auth_mode": auth_mode,
+        "mcp_auth": mcp_auth,
         "default_ledger": d.ledger,
         "language": d.language,
         "controlling_area": d.controlling_area,

@@ -30,6 +30,13 @@ Multi tenant: set nothing and inject `x-s4hc-base-url`, `x-s4hc-user`,
 A connection that names a host but no credentials is refused rather than
 given the server's own. Hosts outside `S4HC_ALLOWED_HOST_SUFFIXES` are refused.
 
+## OAuth and per-user identity (optional)
+
+API key + communication user stays the default. To sign users in with OAuth (OIDC/JWT), run every SAP
+call as the signed-in user (BTP principal propagation, or the CALM-style S/4HANA sign-in), or replace the
+SAP password with OAuth client credentials, see [AUTHENTICATION.md](AUTHENTICATION.md). Private-cloud
+principal propagation needs the BTP Connectivity proxy, so that variant runs on BTP CF/Kyma.
+
 ## Verify
 
 ```bash

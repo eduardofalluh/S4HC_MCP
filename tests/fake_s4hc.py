@@ -122,7 +122,7 @@ CALLS: list[dict] = []
 STATE = {"forbid_costcenter_srv": False, "throttle_once": False, "bad_auth": False, "forbid_gl_srv": False,
          "forbid_plan_srv": False, "usd_line": False, "next_link": None, "forbid_pc_srv": False,
          "forbid_glacct_srv": False, "gl_data_forbidden": False, "je_down": False, "server_page": None,
-         "redirect": False}
+         "redirect": False, "valid_bearers": None}
 BASE = "https://my-api.s4hana.cloud.sap"
 NON_NEGATIVE = ("FiscalPeriod", "LedgerFiscalYear")  # SAP strips leading zeros on output (display-format NonNegative)
 
@@ -229,7 +229,13 @@ def fake_get(self, url, params=None, headers=None, timeout=None, **kwargs):
     u = urlparse(url)
     q = {k: unquote(v[0]) for k, v in parse_qs(u.query).items()}
     q.update(params or {})
-    CALLS.append({"path": u.path, "params": dict(q), "auth": getattr(self, "auth", None)})
+    sent = {**dict(getattr(self, "headers", {}) or {}), **(headers or {})}
+    CALLS.append({"path": u.path, "params": dict(q), "auth": getattr(self, "auth", None), "host": u.netloc,
+                  "scheme": u.scheme, "headers": sent, "proxies": dict(getattr(self, "proxies", {}) or {})})
+    if STATE.get("valid_bearers") is not None and getattr(self, "auth", None) is None:
+        bearer = str(sent.get("Authorization", ""))
+        if not bearer.startswith("Bearer ") or bearer[7:] not in STATE["valid_bearers"]:
+            return FakeResp(401, {"error": {"message": {"value": "Unauthorized"}}})
     service = u.path.split("/sap/opu/odata/sap/")[-1].split("/")[0]
 
     if STATE["bad_auth"]:

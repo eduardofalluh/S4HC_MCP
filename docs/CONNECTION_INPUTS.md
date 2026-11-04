@@ -92,13 +92,12 @@ or custom MCP server provided its conditions are met. How this server meets them
 | Data minimisation (GDPR) | Personal fields (responsible persons, user IDs) are opt-in per deployment (`S4HC_EXPOSE_PERSON_FIELDS`) and never in a default selection. |
 | No raw query surface for the agent | `s4hc_odata_read` disabled by default and refused under any data scope. |
 
-**Known gap to state honestly:** the ref-arch prefers user-context propagation
-(OAuth 2.0 token exchange so each call carries the end user's SAP authorizations).
-Communication arrangements on Public Cloud are system-to-system, so this server
-runs under the communication user and enforces per-user scope itself via the
-allowlists. SAP's own path to true principal propagation is the Integration Suite
-MCP Gateway (OAuth2SAMLBearer token exchange — on SAP's roadmap, not GA as of
-July 2026). If a client requires that, front these same tools with the Gateway.
+**User-context propagation.** The ref-arch prefers that each call carries the end user's SAP
+authorizations. With a communication user (the default) this server runs as that technical user and
+enforces per-user scope itself through the allowlists. Per-user identity is now available as opt-in
+modes, without the Integration Suite MCP Gateway: BTP Destination principal propagation for public
+cloud (`OAuth2SAMLBearerAssertion`) and private cloud (Cloud Connector), or S/4HANA's own OAuth sign-in.
+See [AUTHENTICATION.md](AUTHENTICATION.md) for the modes, setup and what has been verified.
 
 Licensing: SAP lists indirect/digital access as a licensing consideration. Read-only
 use does not create documents, but that does not by itself settle a given

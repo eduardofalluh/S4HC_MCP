@@ -66,6 +66,13 @@ opt-in, refusal of mixed-currency or truncated totals. Compliance mapping and re
 Why Python and not TypeScript: it matches CALM_MCP (same FastMCP stack, same GenAI Studio
 deployment pattern), so the team operates one toolchain.
 
+## Authentication
+
+Default: API key (or none on stdio) towards the MCP, communication user (Basic or X.509) towards SAP.
+Optional, all opt-in: OIDC/JWT sign-in for MCP clients, OAuth 2.0 client credentials to S/4HANA, BTP
+Destination service, and per-user principal propagation for public and private cloud (modelled on
+[ARC-1](https://github.com/arc-mcp/arc-1)). See [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md).
+
 ## Tenant setup (one-time, per tenant)
 
 1. **Maintain Communication Users** → create a user (password or X.509 certificate).
@@ -93,7 +100,7 @@ cp .env.example .env   # fill in S4HC_BASE_URL + credentials
 
 python server.py                      # stdio
 python server.py --http --port 8000   # http://127.0.0.1:8000/mcp
-python -m pytest tests -q             # 112 tests: unit (fake OData backend that mimics a real tenant) + HTTP end-to-end
+python -m pytest tests -q             # 169 tests: unit (fake OData backend that mimics a real tenant) + HTTP end-to-end
 python scripts/live_smoke.py          # all 16 tools against the tenant in S4HC_* (read-only)
 ```
 

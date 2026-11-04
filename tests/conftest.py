@@ -54,10 +54,12 @@ def patch_backend(monkeypatch):
     fake_s4hc.STATE.update(forbid_costcenter_srv=False, throttle_once=False, bad_auth=False, forbid_gl_srv=False,
                            forbid_plan_srv=False, usd_line=False, next_link=None, forbid_pc_srv=False,
                            forbid_glacct_srv=False, gl_data_forbidden=False, je_down=False, server_page=None,
-                           redirect=False)
+                           redirect=False, valid_bearers=None)
     dependencies._cached.clear()
     dependencies._master_cache.clear()
     dependencies._verified.clear()
+    from src.s4hc import sap_auth
+    sap_auth.reset()
     yield
 
 

@@ -169,9 +169,13 @@ class S4HCClient:
         timeout: int = 60,
         retries: int = 3,
         on_verified: Callable[[], None] | None = None,
+        auth_headers: Callable[[], dict[str, str]] | None = None,
+        proxy_url: str | None = None,
+        sap_client: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._on_verified = on_verified
+        self._auth_headers = auth_headers  # called per request, so tokens refresh in place
         self.timeout = timeout
         self.retries = retries
         self.session = requests.Session()
@@ -179,11 +183,17 @@ class S4HCClient:
             self.session.cert = cert
         elif user and password:
             self.session.auth = (user, password)
-        else:
+        elif auth_headers is None:
             raise S4HCError(
-                "No credentials: set S4HC_USER + S4HC_PASSWORD or S4HC_CLIENT_CERT(_PEM)", "NOT_CONFIGURED"
+                "No credentials: set S4HC_USER + S4HC_PASSWORD, S4HC_CLIENT_CERT(_PEM) or an S4HC_SAP_AUTH token mode",
+                "NOT_CONFIGURED"
             )
         self.session.headers.update({"Accept": "application/json"})
+        if sap_client:
+            self.session.headers["sap-client"] = sap_client
+        if proxy_url:  # BTP Connectivity proxy (OnPremise destinations); never the environment's proxy
+            self.session.trust_env = False
+            self.session.proxies = {"http": proxy_url, "https": proxy_url}
         self.verified = False  # set once SAP has accepted these credentials
 
     # ------------------------------------------------------------------ http
@@ -196,7 +206,8 @@ class S4HCClient:
             if remaining <= 0:
                 break
             try:
-                r = self.session.get(url, params=params, headers={"Accept": accept},
+                headers = {"Accept": accept, **(self._auth_headers() if self._auth_headers else {})}
+                r = self.session.get(url, params=params, headers=headers,
                                      timeout=min(self.timeout, remaining), allow_redirects=False, stream=True)
             except requests.RequestException as exc:
                 last_exc = exc
@@ -231,7 +242,8 @@ class S4HCClient:
                 "tenant's API host (https://<tenant>-api.s4hana.cloud.sap), not the Fiori launchpad host",
                 "NOT_CONFIGURED")
         if r.status_code == 401:
-            raise S4HCError("401 Unauthorized — check the communication user / certificate", "SAP_UNAUTHORIZED")
+            raise S4HCError("401 Unauthorized — S/4HANA rejected the credential (communication user, certificate, "
+                            "or an expired/invalid OAuth token: sign in again)", "SAP_UNAUTHORIZED")
         if r.status_code == 403:
             raise S4HCError(
                 f"403 Forbidden on {path} — no active communication arrangement exposes this "
