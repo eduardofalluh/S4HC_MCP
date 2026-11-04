@@ -533,9 +533,26 @@ def test_one_sender_cannot_use_up_the_token_check_budget_for_others(monkeypatch)
     ("10.0.0.5", "6.6.6.6, 203.0.113.9", 1, "203.0.113.9"),  # appended by the trusted ingress; 6.6.6.6 is forged
     ("10.0.0.5", "6.6.6.6, 203.0.113.9, 10.0.0.9", 2, "203.0.113.9"),
     ("10.0.0.5", "203.0.113.9", 2, "10.0.0.5"),  # shorter chain than configured: did not come through the proxies
+    ("10.0.0.5", "6.6.6.6, 203.0.113.9:4711", 1, "203.0.113.9"),  # a per-connection port is not a new sender
+    ("10.0.0.5", "6.6.6.6, [2001:db8::7]:443", 1, "2001:db8::7"),
+    ("10.0.0.5", "6.6.6.6, 2001:db8::7", 1, "2001:db8::7"),
 ])
 def test_token_check_sender_is_taken_from_trusted_proxies_only(peer, xff, hops, expected):
     assert inbound_auth._source_of(peer, xff, hops) == expected
+
+
+def test_token_check_sender_reads_every_forwarded_for_line(monkeypatch):
+    """A proxy that adds its own X-Forwarded-For line must not let the caller's forged line win."""
+    from fastmcp.server.dependencies import _current_http_request
+    from starlette.requests import Request
+    request = Request({"type": "http", "method": "POST", "path": "/mcp", "client": ("10.0.0.5", 50000),
+                       "headers": [(b"x-forwarded-for", b"6.6.6.6"), (b"x-forwarded-for", b"203.0.113.9")]})
+    token = _current_http_request.set(request)
+    try:
+        assert inbound_auth._request_source(1) == "203.0.113.9"
+        assert inbound_auth._request_source(0) == "10.0.0.5"
+    finally:
+        _current_http_request.reset(token)
 
 
 def test_each_sap_user_token_is_its_own_session_principal(monkeypatch):

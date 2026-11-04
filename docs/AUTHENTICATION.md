@@ -163,8 +163,12 @@ authenticated, so every path to SAP is bounded. A token SAP has not seen yet is 
 (default 60) in all; over that it gets `401` without SAP being asked, and a refused token is remembered
 for 1 minute. The sender is the peer address, or, behind N trusted proxies (`S4HC_TRUSTED_PROXY_HOPS=N`,
 default 0), the `X-Forwarded-For` entry the outermost of them appended; entries left of it are set by the
-caller and ignored. So one sender cannot use up the budget for everyone; a flood from many senders can still
-delay sign-ins and token refreshes (a refreshed token is a new token). A token SAP has accepted is trusted
+caller and ignored. **Behind an ingress, set `S4HC_TRUSTED_PROXY_HOPS`** to the number of proxies that
+append `X-Forwarded-For`: otherwise every caller is the ingress, one sender, and anyone can use up that one
+share for everyone. With it set, one sender cannot block the others; a flood from many senders can still
+delay sign-ins and token refreshes (a refreshed token is a new token), and with the defaults three senders
+use up the global budget. All users of one MCP client platform (GenAI Studio's egress, say) are one sender,
+so size `S4HC_SAP_TOKEN_CHECKS_PER_SOURCE_PER_MIN` for their peak sign-ins and refreshes per minute. A token SAP has accepted is trusted
 for 5 minutes, then re-checked outside that budget, one check per token at a time; while that check is
 running or SAP does not answer (retried after 30 s), the token stays valid for up to 10 minutes after SAP
 last confirmed it. Only SAP refusing it revokes it. Each token is its own MCP session principal, so a

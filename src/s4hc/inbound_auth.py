@@ -118,8 +118,18 @@ def _source_of(peer: str, forwarded_for: str, trusted_hops: int) -> str:
     if trusted_hops > 0:
         chain = [p.strip() for p in forwarded_for.split(",") if p.strip()]
         if len(chain) >= trusted_hops:
-            return chain[-trusted_hops]
+            return _address_only(chain[-trusted_hops])
     return peer
+
+
+def _address_only(entry: str) -> str:
+    """Some proxies append ``ip:port``; a port that changes per connection must not
+    turn one sender into many."""
+    if entry.startswith("[") and "]" in entry:  # [IPv6]:port
+        return entry[1:entry.index("]")]
+    if entry.count(":") == 1:  # IPv4:port
+        return entry.split(":", 1)[0]
+    return entry
 
 
 def _request_source(trusted_hops: int) -> str:
@@ -129,7 +139,8 @@ def _request_source(trusted_hops: int) -> str:
     except Exception:  # noqa: BLE001 - no HTTP request (stdio, unit tests)
         return "-"
     peer = request.client.host if request.client else "-"
-    return _source_of(peer, request.headers.get("x-forwarded-for", ""), trusted_hops)
+    # Every header line, in order: a proxy may add its own line instead of extending the caller's.
+    return _source_of(peer, ", ".join(request.headers.getlist("x-forwarded-for")), trusted_hops)
 
 
 class SapUserTokenVerifier(TokenVerifier):

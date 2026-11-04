@@ -100,7 +100,7 @@ cp .env.example .env   # fill in S4HC_BASE_URL + credentials
 
 python server.py                      # stdio
 python server.py --http --port 8000   # http://127.0.0.1:8000/mcp
-python -m pytest tests -q             # 202 tests: unit (fake OData backend that mimics a real tenant) + HTTP end-to-end
+python -m pytest tests -q             # 206 tests: unit (fake OData backend that mimics a real tenant) + HTTP end-to-end
 python scripts/live_smoke.py          # all 16 tools against the tenant in S4HC_* (read-only)
 ```
 
@@ -122,7 +122,8 @@ Claude Desktop (`claude_desktop_config.json`):
 
 Same as CALM MCP: run `python server.py --http --host 0.0.0.0 --port 8000`, set
 `S4HC_*` as deployment secrets (single-quote values containing `$`), keep
-`MCP_TRUST_PROXY=true` behind the ingress. For several client tenants on one
+`MCP_TRUST_PROXY=true` behind the ingress. With the S/4HANA sign-in (`S4HC_SAP_AUTH=user_token`), also set
+`S4HC_TRUSTED_PROXY_HOPS` (see [AUTHENTICATION.md](docs/AUTHENTICATION.md)). For several client tenants on one
 deployment, leave the env vars empty and inject `x-s4hc-base-url`,
 `x-s4hc-user`, `x-s4hc-password` per connection.
 
