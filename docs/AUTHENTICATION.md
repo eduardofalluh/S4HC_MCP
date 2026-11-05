@@ -225,7 +225,7 @@ from step 4, space or comma separated). Optional: `S4HC_SAP_OAUTH_AUTHORIZE_URL`
 `https://<tenant>.s4hana.cloud.sap/sap/bc/sec/oauth2/authorize`, the UI host), `S4HC_SAP_OAUTH_TOKEN_URL`
 (default `https://<tenant>-api.s4hana.cloud.sap/sap/public/bc/sec/oauth2/token`, the public-client token
 endpoint the arrangement shows; `S4HC_OAUTH_TOKEN_URL` is read when it is unset), `S4HC_SAP_OAUTH_PKCE`
-(default true). The metadata lists `none` as a token endpoint auth method, so a client registered as a
+(default true). While PKCE is on, the metadata lists `none` as a token endpoint auth method, so a client registered as a
 public client sends no secret. Keep `S4HC_USER` / `S4HC_PASSWORD` and add `S4HC_MIXED_AUTH=true` and
 `S4HC_MCP_API_KEY` to keep the API key working beside the sign-in.
 
