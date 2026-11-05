@@ -105,7 +105,7 @@ def register(mcp: FastMCP) -> None:
                 config.JOURNAL_ITEM_SERVICE, "A_CostCenter",
                 select=select, filter_=flt, orderby="CostCenter", top=fetch_top,
             )
-            source = "API_JOURNALENTRYITEMBASIC_SRV (fallback, no names — enable SAP_COM_0087 for names)"
+            source = "API_JOURNALENTRYITEMBASIC_SRV (fallback, no names — enable API_COSTCENTER_SRV for names)"
             out = rows
         out = filter_rows_to_scope(ctx, out)
         if len(out) > top:

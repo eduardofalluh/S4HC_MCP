@@ -727,12 +727,50 @@ def test_api_key_is_accepted_but_carries_no_user():
       "S4HC_PUBLIC_URL": "https://mcp.example"}, "must be https"),
     ({"S4HC_SAP_AUTH": "principal_propagation"}, "needs signed-in users"),
     ({"S4HC_SAP_AUTH": "user_token", "S4HC_OIDC_ISSUER": ISSUER}, "cannot be combined"),
+    ({"S4HC_SAP_AUTH": "user_token", "S4HC_PUBLIC_URL": "https://mcp.example",
+      "S4HC_SAP_OAUTH_TOKEN_URL": "http://my-api.s4hana.cloud.sap/sap/public/bc/sec/oauth2/token"}, "must be an https"),
+    ({"S4HC_SAP_AUTH": "user_token", "S4HC_PUBLIC_URL": "https://mcp.example",
+      "S4HC_SAP_OAUTH_AUTHORIZE_URL": "https://user:pw@my.s4hana.cloud.sap/sap/bc/sec/oauth2/authorize"},
+     "without credentials"),
 ])
 def test_auth_misconfiguration_fails_at_startup(monkeypatch, env, match):
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     with pytest.raises(S4HCError, match=match):
         inbound_auth.build_auth_provider()
+
+
+def _sign_in_metadata():
+    provider = inbound_auth.build_auth_provider()
+    route = next(r for r in provider.get_routes() if r.path == "/.well-known/oauth-authorization-server")
+    return json.loads(asyncio.run(route.endpoint(None)).body)
+
+
+@pytest.mark.parametrize("env,token_url", [
+    ({}, "https://my-api.s4hana.cloud.sap/sap/public/bc/sec/oauth2/token"),
+    ({"S4HC_OAUTH_TOKEN_URL": "https://my-api.s4hana.cloud.sap/older/token"},
+     "https://my-api.s4hana.cloud.sap/older/token"),
+    ({"S4HC_OAUTH_TOKEN_URL": "https://my-api.s4hana.cloud.sap/older/token",
+      "S4HC_SAP_OAUTH_TOKEN_URL": "https://my-api.s4hana.cloud.sap/sign-in/token"},
+     "https://my-api.s4hana.cloud.sap/sign-in/token"),
+])
+def test_sign_in_token_url_precedence(monkeypatch, env, token_url):
+    monkeypatch.setenv("S4HC_SAP_AUTH", "user_token")
+    monkeypatch.setenv("S4HC_PUBLIC_URL", "https://mcp.example")
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    assert _sign_in_metadata()["token_endpoint"] == token_url
+
+
+def test_sign_in_offers_a_public_client_only_with_pkce(monkeypatch):
+    monkeypatch.setenv("S4HC_SAP_AUTH", "user_token")
+    monkeypatch.setenv("S4HC_PUBLIC_URL", "https://mcp.example")
+    meta = _sign_in_metadata()
+    assert meta["token_endpoint_auth_methods_supported"][0] == "none"
+    monkeypatch.setenv("S4HC_SAP_OAUTH_PKCE", "false")
+    meta = _sign_in_metadata()
+    assert "none" not in meta["token_endpoint_auth_methods_supported"]
+    assert "code_challenge_methods_supported" not in meta
 
 
 def test_signed_in_users_get_their_own_rate_limit_bucket_on_a_shared_identity(as_user):
@@ -793,6 +831,8 @@ def _serve(tmp_path_factory, extra_env):
         sys.path.insert(0, {TESTS!r})
         import requests, fake_s4hc
         requests.Session.get = fake_s4hc.fake_get
+        import dotenv  # the developer's .env must not configure the server under test
+        dotenv.load_dotenv = lambda *a, **k: False
     """))
     port = _free_port()
     env = {k: v for k, v in os.environ.items() if not k.startswith("S4HC_")}

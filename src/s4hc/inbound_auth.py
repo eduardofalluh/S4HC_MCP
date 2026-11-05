@@ -41,6 +41,7 @@ from . import config
 from .client import HeaderAuth
 from .errors import S4HCError
 from .governance import _TokenBucket
+from .sap_auth import _https
 
 CLOCK_SKEW_SECONDS = 60
 SAP_TOKEN_CHECK_TTL = 300
@@ -317,29 +318,38 @@ class OidcProvider(_AcceptsApiKeyHeader, RemoteAuthProvider):
     """RFC 9728 resource server for an external identity provider."""
 
 
+def sap_oauth_endpoints() -> tuple[str, str]:
+    """S/4HANA's authorize and token endpoints for the sign-in metadata. S/4HANA Cloud signs
+    business users in through public OAuth clients (authorization code + PKCE, no secret), whose
+    token endpoint is the /sap/public/ one (seen on a tenant, 2026-11)."""
+    api = config.get_base_url(None)
+    authorize = os.getenv("S4HC_SAP_OAUTH_AUTHORIZE_URL") or f"{api.replace('-api.', '.', 1)}/sap/bc/sec/oauth2/authorize"
+    token = (os.getenv("S4HC_SAP_OAUTH_TOKEN_URL") or os.getenv("S4HC_OAUTH_TOKEN_URL")
+             or f"{api}/sap/public/bc/sec/oauth2/token")
+    return (_https(authorize, "S4HC_SAP_OAUTH_AUTHORIZE_URL"),
+            _https(token, "S4HC_SAP_OAUTH_TOKEN_URL (or S4HC_OAUTH_TOKEN_URL)"))
+
+
 class SapOAuthProvider(_AcceptsApiKeyHeader, RemoteAuthProvider):
     """RFC 9728 metadata plus an RFC 8414 document describing S/4HANA's own OAuth
     endpoints, which S/4HANA does not publish itself (checked on a 2026 tenant)."""
 
     def get_routes(self, mcp_path: str | None = None) -> list[Route]:
         routes = super().get_routes(mcp_path)
-        api = config.get_base_url(None)
-        authorize = os.getenv("S4HC_SAP_OAUTH_AUTHORIZE_URL") or f"{api.replace('-api.', '.', 1)}/sap/bc/sec/oauth2/authorize"
-        # S/4HANA Cloud signs business users in through public OAuth clients (authorization code +
-        # PKCE, no secret), whose token endpoint is the /sap/public/ one (seen on a tenant, 2026-11).
-        token = (os.getenv("S4HC_SAP_OAUTH_TOKEN_URL") or os.getenv("S4HC_OAUTH_TOKEN_URL")
-                 or f"{api}/sap/public/bc/sec/oauth2/token")
+        authorize, token = sap_oauth_endpoints()
         meta = {
             "issuer": public_url(),
             "authorization_endpoint": authorize,
             "token_endpoint": token,
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
-            "token_endpoint_auth_methods_supported": ["none", "client_secret_basic", "client_secret_post"],
+            "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
             "scopes_supported": _csv(os.getenv("S4HC_SAP_OAUTH_SCOPES")),
         }
         if (os.getenv("S4HC_SAP_OAUTH_PKCE", "true").lower() in ("1", "true", "yes")):
             meta["code_challenge_methods_supported"] = ["S256"]
+            # A public client (no secret) is only safe with PKCE, so it is offered only with it.
+            meta["token_endpoint_auth_methods_supported"].insert(0, "none")
 
         async def metadata(_: Request) -> JSONResponse:
             return JSONResponse(meta, headers={"Cache-Control": "public, max-age=3600"})
@@ -356,6 +366,7 @@ def build_auth_provider():
             raise S4HCError("S4HC_SAP_AUTH=user_token signs users in at S/4HANA; it cannot be combined with "
                             "S4HC_OIDC_ISSUER", "NOT_CONFIGURED")
         base = public_url()
+        sap_oauth_endpoints()  # refuse a bad sign-in URL at startup, not when a client first asks
         return SapOAuthProvider(token_verifier=ApiKeyOrVerifier(SapUserTokenVerifier(), api_key),
                                 authorization_servers=[base], base_url=base,
                                 scopes_supported=_csv(os.getenv("S4HC_SAP_OAUTH_SCOPES")),

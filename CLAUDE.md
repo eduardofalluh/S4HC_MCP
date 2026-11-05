@@ -13,7 +13,7 @@ shape as the sibling `CALM_MCP` repo.
 ## Commands
 
 - Install: `python -m venv venv && source venv/bin/activate && pip install -r requirements.txt`
-- Test: `python -m pytest tests -q` (215 tests: unit tests against a fake OData backend in `tests/fake_s4hc.py`, the review regression tests in `tests/test_review_fixes.py`, OAuth / principal propagation in `tests/test_oauth.py` (faked BTP Destination + Connectivity services), plus HTTP end-to-end tests in `tests/test_http_e2e.py` that spawn the real server process)
+- Test: `python -m pytest tests -q` (221 tests: unit tests against a fake OData backend in `tests/fake_s4hc.py`, the review regression tests in `tests/test_review_fixes.py`, OAuth / principal propagation in `tests/test_oauth.py` (faked BTP Destination + Connectivity services), plus HTTP end-to-end tests in `tests/test_http_e2e.py` that spawn the real server process)
 - Live check: `python scripts/live_smoke.py` runs all 16 tools against the tenant in `S4HC_*` (read-only; prints counts and totals, never rows or credentials)
 - Lint and type-check: none configured (no ruff/flake8/mypy/pyproject in the repo)
 - Run locally: `cp .env.example .env` (fill in `S4HC_BASE_URL` + credentials), then `python server.py` (stdio) or `python server.py --http --port 8000` (Streamable HTTP at `/mcp`)

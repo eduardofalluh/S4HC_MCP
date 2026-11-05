@@ -38,6 +38,8 @@ def server_url(tmp_path_factory):
         sys.path.insert(0, {TESTS!r})
         import requests, fake_s4hc
         requests.Session.get = fake_s4hc.fake_get
+        import dotenv  # the developer's .env must not configure the server under test
+        dotenv.load_dotenv = lambda *a, **k: False
     """))
     port = _free_port()
     env = {k: v for k, v in os.environ.items() if not k.startswith("S4HC_")}
@@ -175,6 +177,8 @@ def keyed_server_url(tmp_path_factory):
         sys.path.insert(0, {TESTS!r})
         import requests, fake_s4hc
         requests.Session.get = fake_s4hc.fake_get
+        import dotenv  # the developer's .env must not configure the server under test
+        dotenv.load_dotenv = lambda *a, **k: False
     """))
     port = _free_port()
     env = {k: v for k, v in os.environ.items() if not k.startswith("S4HC_")}

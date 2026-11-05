@@ -32,8 +32,9 @@ Integration) allows only Basic and certificate authentication, so neither per-us
 or BTP SAML bearer) works on an arrangement of it. `SAP_COM_0241` (Finance - Cloud Consolidation Data
 Collection Integration) allows OAuth 2.0 and contains `API_JOURNALENTRYITEMBASIC_SRV`, `API_COMPANYCODE_SRV`,
 `API_GLACCOUNTINCHARTOFACCOUNTS_SRV` and `API_GLACCOUNTLINEITEM`, but not the cost center or profit center
-master services: for signed-in users the cost center and profit center tools then fall back to the journal
-entry service, without names, unless another OAuth-capable arrangement covers those services.
+master services or the plan service (`API_FINPLANNINGENTRYITEM_SRV`): for signed-in users the cost center
+and profit center tools then fall back to the journal entry service, without names, and `get_actual_vs_plan`
+answers `PLAN_UNAVAILABLE`, unless another OAuth-capable arrangement covers those services.
 The arrangement page shows which methods a scenario allows: picking OAuth 2.0 on one that does not answer
 "This scenario doesn't support this authentication method".
 
