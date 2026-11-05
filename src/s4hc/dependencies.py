@@ -120,6 +120,12 @@ def _signed_in_subject(ctx: Context | None) -> str | None:
     return None
 
 
+def _has_signed_in_user(ctx: Context | None) -> bool:
+    """A verified user token (OIDC subject or S/4HANA token), as opposed to the API key or stdio."""
+    claims = getattr(_access_token(ctx), "claims", None) or {}
+    return bool(claims.get("s4hc_sap_user_token") or _signed_in_subject(ctx))
+
+
 def caller_identity(ctx: Context | None) -> str | None:
     """Audit identity of a signed-in caller: the token's subject, never a header."""
     tok = _access_token(ctx)
@@ -176,11 +182,15 @@ def _destination_name() -> str:
 def resolve_connection(ctx: Context | None = None) -> Connection:
     """Who this call reaches SAP as. Cheap: no network. Token-based credentials are
     fetched lazily (Connection.headers / Connection.target) when a client is built."""
-    from .inbound_auth import sap_auth_mode
+    from .inbound_auth import mixed_auth, sap_auth_mode
 
     mode = sap_auth_mode()
     if mode in ("principal_propagation", "user_token"):
-        return _user_connection(ctx, mode)
+        if not (mixed_auth() and not _has_signed_in_user(ctx)):
+            return _user_connection(ctx, mode)
+        # Mixed mode, and no signed-in user (API key, stdio): the previous setup below.
+        # Decided by how the caller signed in, so a signed-in user never lands here.
+        mode = ""
 
     h_url = _header(ctx, HEADER_PREFIX + "base-url")
     h_user = _header(ctx, HEADER_PREFIX + "user")
@@ -346,8 +356,9 @@ def cached(ctx: Context | None, key: str, loader: Callable[[], Any]) -> Any:
 
 
 def connection_info(ctx: Context | None = None) -> dict[str, Any]:
-    """Non-secret summary of how the connection is configured."""
-    from .inbound_auth import oidc_enabled, sap_auth_mode
+    """Non-secret summary of how the connection is configured. auth_mode is how this
+    caller reaches SAP; signed_in_users is how signed-in users do, in a per-user mode."""
+    from .inbound_auth import mixed_auth, oidc_enabled, sap_auth_mode
 
     modes = {"header": "header-basic", "oauth2": "oauth2-client-credentials", "destination": "btp-destination",
              "principal_propagation": "principal-propagation", "user_token": "sap-user-token"}
@@ -372,10 +383,13 @@ def connection_info(ctx: Context | None = None) -> dict[str, Any]:
     d = get_defaults(ctx)
     mcp_auth = ("sap-oauth" if sap_auth_mode() == "user_token" else "oidc" if oidc_enabled()
                 else "api-key" if os.getenv("S4HC_MCP_API_KEY") else "none")
+    per_user = sap_auth_mode() if sap_auth_mode() in ("principal_propagation", "user_token") else None
     return {
         "base_url": base_url,
         "auth_mode": auth_mode,
         "mcp_auth": mcp_auth,
+        "signed_in_users": modes[per_user] if per_user else None,
+        "mixed_auth": bool(per_user) and mixed_auth(),
         "default_ledger": d.ledger,
         "language": d.language,
         "controlling_area": d.controlling_area,

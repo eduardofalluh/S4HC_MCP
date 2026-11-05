@@ -376,6 +376,74 @@ def test_pp_refuses_a_technical_destination(tool, calls, btp, as_user, monkeypat
     assert not odata_calls(calls) and not [p for p in btp.posts if p["url"] == CONN_UAA]
 
 
+API_KEY_CALLER = AccessToken(token="api-key", client_id="api-key", scopes=[], claims={"s4hc_api_key": True})
+
+
+def test_mixed_mode_signed_in_users_as_themselves_api_key_as_before(tool, calls, btp, as_user, monkeypatch):
+    """S4HC_MIXED_AUTH (ARC-1: SAP_PP_STRICT=false): both ways of connecting on one deployment."""
+    pp(monkeypatch, "S4_PUBLIC_PP")
+    monkeypatch.setenv("S4HC_MIXED_AUTH", "true")
+    as_user(signed_in("alice"))
+    tool("list_company_codes")(ctx=None)
+    assert {c["headers"].get("Authorization") for c in odata_calls(calls)} == {"Bearer s4-user-alice"}
+    assert all(c["auth"] is None for c in odata_calls(calls))
+    for caller in (API_KEY_CALLER, None):  # API key over HTTP, or stdio
+        calls.clear()
+        as_user(caller)
+        tool("get_cost_center_actuals")(ctx=None, fiscal_year=2026)
+        from conftest import TEST_PASSWORD, TEST_USER
+        assert {c["auth"] for c in odata_calls(calls)} == {(TEST_USER, TEST_PASSWORD)}  # the communication user
+    assert len(btp.lookups) == 1 and _sub(btp.lookups[0]["user"]) == "alice"  # only alice's call went through BTP
+
+
+def test_mixed_mode_api_key_caller_can_bring_tenant_headers(btp, as_user, monkeypatch):
+    from test_review_fixes import Ctx
+    pp(monkeypatch, "S4_PUBLIC_PP")
+    monkeypatch.setenv("S4HC_MIXED_AUTH", "true")
+    as_user(API_KEY_CALLER)
+    conn = dependencies.resolve_connection(Ctx({"x-s4hc-base-url": "https://tenant-api.s4hana.cloud.sap",
+                                                "x-s4hc-user": "comm", "x-s4hc-password": RUN["basic_pw"]}))
+    assert (conn.source, conn.base_url) == ("header", "https://tenant-api.s4hana.cloud.sap")
+
+
+def test_mixed_mode_never_moves_a_signed_in_user_to_the_shared_account(tool, calls, btp, as_user, monkeypatch):
+    from test_review_fixes import Ctx
+    pp(monkeypatch, "S4_BROKEN")
+    monkeypatch.setenv("S4HC_MIXED_AUTH", "true")
+    as_user(signed_in("alice"))
+    with pytest.raises(S4HCError, match="SAML trust missing"):
+        tool("list_company_codes")(ctx=None)
+    assert not odata_calls(calls)  # refused, not retried as the communication user
+    with pytest.raises(S4HCError, match="not accepted"):
+        dependencies.resolve_connection(Ctx({"x-s4hc-user": "comm", "x-s4hc-password": RUN["basic_pw"]}))
+
+
+def test_mixed_mode_with_the_s4hana_sign_in(tool, calls, as_user, monkeypatch):
+    monkeypatch.setenv("S4HC_SAP_AUTH", "user_token")
+    monkeypatch.setenv("S4HC_MIXED_AUTH", "true")
+    fake_s4hc.STATE["valid_bearers"] = {"s4-opaque-alice"}
+    as_user(AccessToken(token="s4-opaque-alice", client_id="s4hana-oauth", scopes=[],
+                        claims={"s4hc_sap_user_token": True}))
+    tool("list_company_codes")(ctx=None)
+    assert {c["headers"]["Authorization"] for c in odata_calls(calls)} == {"Bearer s4-opaque-alice"}
+    fake_s4hc.STATE["valid_bearers"] = None
+    calls.clear()
+    as_user(API_KEY_CALLER)
+    tool("get_cost_center_actuals")(ctx=None, fiscal_year=2026)
+    assert all(c["auth"] is not None for c in odata_calls(calls))
+
+
+def test_mixed_mode_shows_both_paths_in_health(tool, btp, as_user, monkeypatch):
+    pp(monkeypatch, "S4_PUBLIC_PP")
+    info = tool("s4hc_health")(ctx=None)
+    assert (info["auth_mode"], info["signed_in_users"], info["mixed_auth"]) == (
+        "principal-propagation", "principal-propagation", False)
+    monkeypatch.setenv("S4HC_MIXED_AUTH", "true")
+    info = tool("s4hc_health")(ctx=None)
+    assert (info["status"], info["auth_mode"], info["signed_in_users"], info["mixed_auth"]) == (
+        "configured", "basic", "principal-propagation", True)
+
+
 def test_pp_refuses_header_credentials(btp, as_user, monkeypatch):
     from test_review_fixes import Ctx
     pp(monkeypatch, "S4_PUBLIC_PP")
@@ -754,6 +822,34 @@ def test_http_oidc_challenge_metadata_and_tokens(oidc_server):
                       headers={"Accept": "application/json, text/event-stream", "Authorization": f"Bearer {wrong_aud}"})
     assert r.status_code == 401
     assert call(mcp, "s4hc_health", headers={"Authorization": f"Bearer {RUN['api_key']}"})["mcp_auth"] == "oidc"
+    # Clients set up for the API key alone send it as x-api-key; that keeps working with OIDC on.
+    assert call(mcp, "list_company_codes", headers={"x-api-key": RUN["api_key"]})["count"] == 2
+    r = requests.post(mcp, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                      headers={"Accept": "application/json, text/event-stream", "x-api-key": RUN["api_key"] + "x"})
+    assert r.status_code == 401
+
+
+@pytest.fixture(scope="module")
+def mixed_server(tmp_path_factory):
+    proc, url = _serve(tmp_path_factory, {"S4HC_OIDC_ISSUER": ISSUER, "S4HC_OIDC_AUDIENCE": AUDIENCE,
+                                          "S4HC_OIDC_PUBLIC_KEY": KEYS.public_key, "S4HC_MCP_API_KEY": RUN["api_key"],
+                                          "S4HC_SAP_AUTH": "principal_propagation", "S4HC_BTP_DESTINATION": "S4",
+                                          "S4HC_MIXED_AUTH": "true"})
+    yield url
+    proc.kill()
+
+
+def test_http_mixed_mode_both_ways_of_connecting(mixed_server):
+    from test_http_e2e import call
+    mcp = f"{mixed_server}/mcp"
+    out = call(mcp, "list_company_codes", headers={"x-api-key": RUN["api_key"]})
+    assert out["count"] == 2  # the previous setup: API key + communication user
+    health = call(mcp, "s4hc_health", headers={"Authorization": f"Bearer {RUN['api_key']}"})
+    assert (health["auth_mode"], health["signed_in_users"], health["mixed_auth"]) == (
+        "basic", "principal-propagation", True)
+    # A signed-in user goes through BTP (not bound here) and is refused, not served as the communication user.
+    out = call(mcp, "list_company_codes", headers={"Authorization": f"Bearer {user_jwt('alice')}"})
+    assert "BTP Destination service not bound" in out["__error__"]
 
 
 @pytest.fixture(scope="module")

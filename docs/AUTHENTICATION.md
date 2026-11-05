@@ -26,11 +26,19 @@ Unset, `S4HC_SAP_AUTH` keeps the old rule (client certificate if one is configur
 | **Each user as themselves — private cloud / on-premise** | OIDC (XSUAA) | `principal_propagation` + `PrincipalPropagation` destination | Above + Connectivity service + Cloud Connector, **server runs on BTP CF/Kyma** |
 | Each user as themselves, **no BTP** (CALM_MCP pattern) | S/4HANA sign-in | `user_token` | Communication user with OAuth 2.0 authorization-code grant; MCP client that does OAuth (GenAI Studio does for CALM) |
 
-Per-user modes are strict, like ARC-1's `SAP_PP_STRICT`: a call without a signed-in user (stdio, API key)
-is refused, and so is a `principal_propagation` destination whose Authentication is a technical one
+Per-user modes are strict by default, like ARC-1's `SAP_PP_STRICT=true`: a call without a signed-in user
+(stdio, API key) is refused, and so is a `principal_propagation` destination whose Authentication is a technical one
 (`BasicAuthentication`, `OAuth2ClientCredentials`, `NoAuthentication`, or a SAML bearer destination with a
 `SystemUser`); nothing ever falls back to a shared SAP identity. The data-scope allowlists still apply on
 top, as a second layer.
+
+**Both ways of connecting on one deployment** (`S4HC_MIXED_AUTH=true`, ARC-1's supported mixed mode,
+`SAP_PP_STRICT=false`): users who sign in run in SAP as themselves, and callers with the API key (and stdio)
+use the previous setup, the communication user (`S4HC_USER` / `S4HC_PASSWORD` or a certificate) or the
+`x-s4hc-*` tenant headers. Which path a call takes depends only on how the caller authenticated: a signed-in
+user is never moved to the shared account (if their per-user call fails, it is refused), and sending
+`x-s4hc-*` headers with a user sign-in is still refused. `s4hc_health` shows both (`auth_mode` for this
+caller, `signed_in_users` for signed-in users) and the startup log names both.
 
 With OIDC, each signed-in user gets their own rate-limit bucket (`S4HC_RATE_LIMIT_PER_MIN`), also on a
 shared SAP identity; `S4HC_RATE_LIMIT_GLOBAL_PER_MIN` still caps them together.
@@ -93,9 +101,8 @@ API key as an identity without a user, and logging the verified subject instead 
 
 Tokens need a valid signature, issuer, audience, `exp`, `sub` and (if present) `nbf`. Unauthenticated calls
 get `401` with `WWW-Authenticate: Bearer resource_metadata=".../.well-known/oauth-protected-resource/mcp"`,
-which is how MCP clients find the sign-in. `S4HC_MCP_API_KEY` stays valid for automation, but only as
-`Authorization: Bearer <key>`: once OIDC or the S/4HANA sign-in is on, the `x-api-key` header is no
-longer read.
+which is how MCP clients find the sign-in. `S4HC_MCP_API_KEY` stays valid, as `Authorization: Bearer <key>`
+or `x-api-key: <key>`; it carries no user.
 
 ### Hop 2 — `oauth2_client_credentials`
 

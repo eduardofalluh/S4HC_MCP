@@ -29,7 +29,7 @@ Studio) is recorded as the caller in the audit log.
 
 | Secret / flag | Default | Purpose |
 |---|---|---|
-| `S4HC_MCP_API_KEY` | unset | When set, every call to `/mcp` must send `Authorization: Bearer <key>` (or `x-api-key`; with OIDC or `S4HC_SAP_AUTH=user_token` only the Bearer form). Protects the AI-client → MCP hop. Without it, `--http` refuses to bind a non-loopback host. |
+| `S4HC_MCP_API_KEY` | unset | When set, every call to `/mcp` must send `Authorization: Bearer <key>` (or `x-api-key`), also with OIDC or the S/4HANA sign-in on. `S4HC_MIXED_AUTH=true` lets API-key callers keep the communication user in a per-user deployment (see AUTHENTICATION.md). Protects the AI-client → MCP hop. Without it, `--http` refuses to bind a non-loopback host. |
 | `S4HC_MCP_ALLOW_UNAUTHENTICATED` | `false` | Set `true` only when the platform in front authenticates every caller and you deliberately run without the key. |
 | `S4HC_ALLOWED_ORIGINS` | unset | Browser origins allowed to call `/mcp`. Any request carrying another `Origin` header gets 403 (DNS-rebinding guard); server-side MCP clients send none. |
 | `S4HC_EXPOSE_PERSON_FIELDS` | `false` | Responsible-person names and user IDs (`CostCtrResponsiblePersonName`, `ProfitCtrResponsibleUser`, `AccountingDocCreatedByUser`, …) are personal data sent to the LLM provider. They are never selected by default and can only be requested via `fields` when this is `true`. |

@@ -36,6 +36,9 @@ API key + communication user stays the default. To sign users in with OAuth (OID
 call as the signed-in user (BTP principal propagation, or the CALM-style S/4HANA sign-in), or replace the
 SAP password with OAuth client credentials, see [AUTHENTICATION.md](AUTHENTICATION.md). Private-cloud
 principal propagation needs the BTP Connectivity proxy, so that variant runs on BTP CF/Kyma.
+To offer both ways of connecting on one deployment, mainly user sign-in but with the API key +
+communication user still working, set `S4HC_MIXED_AUTH=true` next to the per-user mode and keep
+`S4HC_MCP_API_KEY` and `S4HC_USER` / `S4HC_PASSWORD` (or the `x-s4hc-*` headers) as today.
 With the S/4HANA sign-in (`S4HC_SAP_AUTH=user_token`) behind the cluster ingress, set
 `S4HC_TRUSTED_PROXY_HOPS` to the number of proxies that append `X-Forwarded-For` (usually 1), and size
 `S4HC_SAP_TOKEN_CHECKS_PER_SOURCE_PER_MIN` (default 20) for GenAI Studio's peak sign-ins and token refreshes

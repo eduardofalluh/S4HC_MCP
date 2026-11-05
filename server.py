@@ -156,7 +156,10 @@ def connection_info_mode() -> str:
     from src.s4hc.dependencies import connection_info
 
     info = connection_info(None)
-    return f"MCP={info['mcp_auth']} SAP={info['auth_mode']}"
+    if info["mixed_auth"]:
+        return (f"MCP={info['mcp_auth']} SAP={info['signed_in_users']} for signed-in users, "
+                f"{info['auth_mode']} for API-key calls (mixed)")
+    return f"MCP={info['mcp_auth']} SAP={info['signed_in_users'] or info['auth_mode']}"
 
 
 def _startup_check() -> None:
@@ -164,7 +167,15 @@ def _startup_check() -> None:
 
     info = connection_info(None)
     mode = (os.getenv("S4HC_SAP_AUTH") or "").strip().lower()
-    if info["auth_mode"] == "none" and mode not in ("", "basic"):
+    if os.getenv("S4HC_MIXED_AUTH") and not info["signed_in_users"]:
+        log.warning("S4HC_MIXED_AUTH has no effect: S4HC_SAP_AUTH is not principal_propagation or user_token")
+    if info["mixed_auth"]:
+        log.info("Mixed sign-in: signed-in users reach SAP as themselves (%s); API-key calls use %s at %s",
+                 info["signed_in_users"], info["auth_mode"], info["base_url"])
+        if info["auth_mode"] == "none":
+            log.warning("Mixed sign-in: no S4HC_USER/S4HC_PASSWORD or certificate, so API-key calls need "
+                        "x-s4hc-* headers")
+    elif info["auth_mode"] == "none" and mode not in ("", "basic"):
         log.warning("S4HC_SAP_AUTH=%s is not usable: %s", mode, info["base_url"])
     elif info["auth_mode"] == "none":
         log.warning("No S4HC_USER/S4HC_PASSWORD or client certificate set — expecting per-request x-s4hc-* headers.")

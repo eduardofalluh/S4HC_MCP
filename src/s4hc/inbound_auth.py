@@ -32,6 +32,7 @@ import anyio
 import requests
 from fastmcp.server.auth import AccessToken, RemoteAuthProvider, TokenVerifier
 from fastmcp.server.auth.providers.jwt import JWTVerifier
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -64,6 +65,14 @@ def sap_auth_mode() -> str:
 
 def oidc_enabled() -> bool:
     return bool(os.getenv("S4HC_OIDC_ISSUER"))
+
+
+def mixed_auth() -> bool:
+    """S4HC_MIXED_AUTH=true (ARC-1: SAP_PP_STRICT=false): in a per-user mode, callers
+    without a signed-in user (API key, stdio) use the previous setup, the communication
+    user or x-s4hc-* headers, instead of being refused. Signed-in users still always run
+    as themselves: a failed per-user call is refused, never retried as the shared user."""
+    return (os.getenv("S4HC_MIXED_AUTH") or "").strip().lower() in ("1", "true", "yes")
 
 
 def public_url() -> str:
@@ -275,7 +284,34 @@ class SapUserTokenVerifier(TokenVerifier):
         return self._accepted(token, k)
 
 
-class SapOAuthProvider(RemoteAuthProvider):
+class _ApiKeyHeaderAsBearer:
+    """Clients set up for the API key alone may send it as ``x-api-key``. FastMCP's
+    OAuth reads only Authorization, so such a request (one without Authorization) is
+    passed on as ``Authorization: Bearer <key>``; ApiKeyOrVerifier then checks it."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http":
+            headers = scope.get("headers", [])
+            names = {k.lower() for k, _ in headers}
+            if b"authorization" not in names and b"x-api-key" in names:
+                key = next(v for k, v in headers if k.lower() == b"x-api-key")
+                scope = {**scope, "headers": [*headers, (b"authorization", b"Bearer " + key)]}
+        await self.app(scope, receive, send)
+
+
+class _AcceptsApiKeyHeader:
+    def get_middleware(self) -> list:
+        return [Middleware(_ApiKeyHeaderAsBearer), *super().get_middleware()]  # type: ignore[misc]
+
+
+class OidcProvider(_AcceptsApiKeyHeader, RemoteAuthProvider):
+    """RFC 9728 resource server for an external identity provider."""
+
+
+class SapOAuthProvider(_AcceptsApiKeyHeader, RemoteAuthProvider):
     """RFC 9728 metadata plus an RFC 8414 document describing S/4HANA's own OAuth
     endpoints, which S/4HANA does not publish itself (checked on a 2026 tenant)."""
 
@@ -338,6 +374,6 @@ def build_auth_provider():
                                  required_scopes=_csv(os.getenv("S4HC_OIDC_REQUIRED_SCOPES")) or None,
                                  base_url=base)
     servers = _csv(os.getenv("S4HC_OIDC_AUTHORIZATION_SERVERS")) or [issuer]
-    return RemoteAuthProvider(token_verifier=ApiKeyOrVerifier(verifier, api_key), authorization_servers=servers,
-                              base_url=base, scopes_supported=_csv(os.getenv("S4HC_OIDC_SCOPES")) or None,
-                              resource_name="SAP S/4HANA Cloud MCP")
+    return OidcProvider(token_verifier=ApiKeyOrVerifier(verifier, api_key), authorization_servers=servers,
+                        base_url=base, scopes_supported=_csv(os.getenv("S4HC_OIDC_SCOPES")) or None,
+                        resource_name="SAP S/4HANA Cloud MCP")
