@@ -57,7 +57,7 @@ def test_user_header_requires_password_header():
 
 
 @pytest.mark.parametrize("url", ["https://internal.example.com", "http://tenant-api.s4hana.cloud.sap",
-                                 "https://tenant-api.s4hana.cloud.sap/sap/opu", "https://u:p@tenant-api.s4hana.cloud.sap",
+                                 "https://tenant-api.s4hana.cloud.sap/sap/opu", "https://comm_user@tenant-api.s4hana.cloud.sap",
                                  "https://tenant-api.s4hana.cloud.sap.evil.com"])
 def test_base_url_must_be_plain_sap_origin(url):
     with pytest.raises(S4HCError, match="NOT_CONFIGURED"):

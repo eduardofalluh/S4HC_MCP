@@ -730,7 +730,7 @@ def test_api_key_is_accepted_but_carries_no_user():
     ({"S4HC_SAP_AUTH": "user_token", "S4HC_PUBLIC_URL": "https://mcp.example",
       "S4HC_SAP_OAUTH_TOKEN_URL": "http://my-api.s4hana.cloud.sap/sap/public/bc/sec/oauth2/token"}, "must be an https"),
     ({"S4HC_SAP_AUTH": "user_token", "S4HC_PUBLIC_URL": "https://mcp.example",
-      "S4HC_SAP_OAUTH_AUTHORIZE_URL": "https://user:pw@my.s4hana.cloud.sap/sap/bc/sec/oauth2/authorize"},
+      "S4HC_SAP_OAUTH_AUTHORIZE_URL": "https://comm_user@my.s4hana.cloud.sap/sap/bc/sec/oauth2/authorize"},
      "without credentials"),
 ])
 def test_auth_misconfiguration_fails_at_startup(monkeypatch, env, match):
