@@ -433,6 +433,21 @@ def test_mixed_mode_with_the_s4hana_sign_in(tool, calls, as_user, monkeypatch):
     assert all(c["auth"] is not None for c in odata_calls(calls))
 
 
+@pytest.mark.parametrize("reserved", ["s4hc_api_key", "s4hc_sap_user_token"])
+def test_a_sign_in_token_cannot_claim_to_be_the_api_key(reserved):
+    """In mixed mode the API key reaches the communication user, so its marker must not be forgeable."""
+    tok = user_jwt("alice", additional_claims={reserved: True})
+    assert asyncio.run(strict_verifier().verify_token(tok)) is None
+
+
+def test_mixed_mode_reports_a_missing_destination(tool, monkeypatch):
+    monkeypatch.setenv("S4HC_SAP_AUTH", "principal_propagation")
+    monkeypatch.setenv("S4HC_MIXED_AUTH", "true")
+    info = tool("s4hc_health")(ctx=None)
+    assert info["auth_mode"] == "basic" and info["signed_in_users"] == "none"  # the API-key path still works
+    assert "S4HC_BTP_DESTINATION" in info["signed_in_users_error"]
+
+
 def test_mixed_mode_shows_both_paths_in_health(tool, btp, as_user, monkeypatch):
     pp(monkeypatch, "S4_PUBLIC_PP")
     info = tool("s4hc_health")(ctx=None)

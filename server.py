@@ -169,9 +169,12 @@ def _startup_check() -> None:
     mode = (os.getenv("S4HC_SAP_AUTH") or "").strip().lower()
     if os.getenv("S4HC_MIXED_AUTH") and not info["signed_in_users"]:
         log.warning("S4HC_MIXED_AUTH has no effect: S4HC_SAP_AUTH is not principal_propagation or user_token")
+    if info["mixed_auth"] and info["signed_in_users_error"]:
+        log.warning("Mixed sign-in: signed-in users cannot be served: %s", info["signed_in_users_error"])
+    elif info["mixed_auth"]:
+        log.info("Mixed sign-in: signed-in users reach SAP as themselves (%s); API-key calls use %s at %s "
+                 "with that account's SAP rights", info["signed_in_users"], info["auth_mode"], info["base_url"])
     if info["mixed_auth"]:
-        log.info("Mixed sign-in: signed-in users reach SAP as themselves (%s); API-key calls use %s at %s",
-                 info["signed_in_users"], info["auth_mode"], info["base_url"])
         if info["auth_mode"] == "none":
             log.warning("Mixed sign-in: no S4HC_USER/S4HC_PASSWORD or certificate, so API-key calls need "
                         "x-s4hc-* headers")

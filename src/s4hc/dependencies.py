@@ -384,11 +384,18 @@ def connection_info(ctx: Context | None = None) -> dict[str, Any]:
     mcp_auth = ("sap-oauth" if sap_auth_mode() == "user_token" else "oidc" if oidc_enabled()
                 else "api-key" if os.getenv("S4HC_MCP_API_KEY") else "none")
     per_user = sap_auth_mode() if sap_auth_mode() in ("principal_propagation", "user_token") else None
+    per_user_error = None
+    if per_user == "principal_propagation":  # in mixed mode the call above may not have checked it
+        try:
+            _destination_name()
+        except S4HCError as exc:
+            per_user_error = str(exc)
     return {
         "base_url": base_url,
         "auth_mode": auth_mode,
         "mcp_auth": mcp_auth,
-        "signed_in_users": modes[per_user] if per_user else None,
+        "signed_in_users": (("none" if per_user_error else modes[per_user]) if per_user else None),
+        "signed_in_users_error": per_user_error,
         "mixed_auth": bool(per_user) and mixed_auth(),
         "default_ledger": d.ledger,
         "language": d.language,

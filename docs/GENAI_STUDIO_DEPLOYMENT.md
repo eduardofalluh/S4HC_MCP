@@ -38,7 +38,10 @@ SAP password with OAuth client credentials, see [AUTHENTICATION.md](AUTHENTICATI
 principal propagation needs the BTP Connectivity proxy, so that variant runs on BTP CF/Kyma.
 To offer both ways of connecting on one deployment, mainly user sign-in but with the API key +
 communication user still working, set `S4HC_MIXED_AUTH=true` next to the per-user mode and keep
-`S4HC_MCP_API_KEY` and `S4HC_USER` / `S4HC_PASSWORD` (or the `x-s4hc-*` headers) as today.
+`S4HC_MCP_API_KEY` and `S4HC_USER` / `S4HC_PASSWORD` (or the `x-s4hc-*` headers) for the shared path. Use two
+GenAI Studio connections: one with OAuth sign-in and **no** API key (each user as themselves), and one with
+the API key (shared account). A connection that sends the key never asks anyone to sign in, and the key
+carries the communication user's SAP rights.
 With the S/4HANA sign-in (`S4HC_SAP_AUTH=user_token`) behind the cluster ingress, set
 `S4HC_TRUSTED_PROXY_HOPS` to the number of proxies that append `X-Forwarded-For` (usually 1), and size
 `S4HC_SAP_TOKEN_CHECKS_PER_SOURCE_PER_MIN` (default 20) for GenAI Studio's peak sign-ins and token refreshes

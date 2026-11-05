@@ -85,7 +85,10 @@ def public_url() -> str:
 
 class StrictJWTVerifier(JWTVerifier):
     """FastMCP's JWTVerifier accepts a token without ``exp`` (it never expires) and
-    does not check ``nbf``. Both are required here."""
+    does not check ``nbf``. Both are required here. Claims named ``s4hc_*`` are this
+    server's own markers (an API-key caller, an S/4HANA token); a user token that
+    carries one is refused, so an identity provider's claims can never make a
+    signed-in user look like the API key and reach the communication user."""
 
     async def load_access_token(self, token: str) -> AccessToken | None:
         verified = await super().load_access_token(token)
@@ -99,6 +102,9 @@ class StrictJWTVerifier(JWTVerifier):
         if isinstance(nbf, (int, float)) and nbf > now + CLOCK_SKEW_SECONDS:
             return None
         if not claims.get("sub"):
+            return None
+        if any(str(name).startswith("s4hc_") for name in claims):
+            log.warning("Sign-in token refused: it carries a claim reserved for this server (s4hc_*)")
             return None
         return verified
 

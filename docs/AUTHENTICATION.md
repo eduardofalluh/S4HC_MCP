@@ -40,6 +40,14 @@ user is never moved to the shared account (if their per-user call fails, it is r
 `x-s4hc-*` headers with a user sign-in is still refused. `s4hc_health` shows both (`auth_mode` for this
 caller, `signed_in_users` for signed-in users) and the startup log names both.
 
+In mixed mode **the API key grants the communication user's SAP rights**, which may be broader than any
+single user's: treat it like that account's password. A connection that sends the key never gets the
+`401` that starts the sign-in, so everyone on it silently uses the shared account. Give the key only to the
+connections meant to use the shared account (automation, a "shared" connection in GenAI Studio), and set up
+personal sign-in as a separate connection that does not send it. A sign-in token that carries a claim named
+`s4hc_*` (reserved for this server's own markers) is refused, so an identity provider's claims cannot make a
+user look like the API key.
+
 With OIDC, each signed-in user gets their own rate-limit bucket (`S4HC_RATE_LIMIT_PER_MIN`), also on a
 shared SAP identity; `S4HC_RATE_LIMIT_GLOBAL_PER_MIN` still caps them together.
 
