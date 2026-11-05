@@ -62,6 +62,9 @@ by all credentials SAP has not accepted yet, so invented ones cannot crowd out r
 | `API_GLACCOUNTLINEITEM` | `get_cost_center_postings` (document-level detail) | `SAP_COM_0303` | Optional |
 
    If `SAP_COM_0087` is used, a **single** arrangement typically covers actuals, cost centers and plan.
+   For users signing in as themselves (S/4HANA sign-in or BTP), the arrangement must be on a scenario
+   that allows OAuth 2.0: `SAP_COM_0087` allows only Basic and certificate, `SAP_COM_0241` allows OAuth 2.0
+   (setup in [AUTHENTICATION.md](AUTHENTICATION.md)).
 4. Copy the inbound service URLs from each arrangement. If a path differs from the defaults, set the matching `S4HC_*_SERVICE` override.
 5. Verify with `s4hc_health(live=true)` → `ok` (all six) or `ok_with_optional_services_missing`. Each service is checked twice: `$metadata` and a one-row data read, because a user can be allowed the first and not the second ("You do not have start authorization for R3TR IWSV …"). The result names what each missing service would enable and echoes the data scope in effect.
 6. Run `python scripts/live_smoke.py` with the same settings: it exercises all 16 tools and exits non-zero on any failure.

@@ -24,7 +24,18 @@ Unset, `S4HC_SAP_AUTH` keeps the old rule (client certificate if one is configur
 | Know *who* called (audit, per-user rate limit), shared SAP identity | OIDC | any technical mode | An IdP that issues JWTs for this server |
 | **Each user runs in S/4HANA as themselves — public cloud** | OIDC (XSUAA of the BTP subaccount) | `principal_propagation` + `OAuth2SAMLBearerAssertion` destination | BTP subaccount, Destination service, SAML trust BTP → S/4HANA |
 | **Each user as themselves — private cloud / on-premise** | OIDC (XSUAA) | `principal_propagation` + `PrincipalPropagation` destination | Above + Connectivity service + Cloud Connector, **server runs on BTP CF/Kyma** |
-| Each user as themselves, **no BTP** (CALM_MCP pattern) | S/4HANA sign-in | `user_token` | Communication user with OAuth 2.0 authorization-code grant; MCP client that does OAuth (GenAI Studio does for CALM) |
+| Each user as themselves, **no BTP** (CALM_MCP pattern) — **verified live** | S/4HANA sign-in | `user_token` | Communication system with an OAuth 2.0 public client (authorization code + PKCE), arrangement on a scenario that allows OAuth 2.0; MCP client that does OAuth (GenAI Studio does for CALM) |
+
+**Per-user identity needs a communication scenario that allows OAuth 2.0.** S/4HANA decides this per
+scenario, and no setting on this server changes it: `SAP_COM_0087` (SAP Analytics Cloud for Planning
+Integration) allows only Basic and certificate authentication, so neither per-user route (S/4HANA sign-in
+or BTP SAML bearer) works on an arrangement of it. `SAP_COM_0241` (Finance - Cloud Consolidation Data
+Collection Integration) allows OAuth 2.0 and contains `API_JOURNALENTRYITEMBASIC_SRV`, `API_COMPANYCODE_SRV`,
+`API_GLACCOUNTINCHARTOFACCOUNTS_SRV` and `API_GLACCOUNTLINEITEM`, but not the cost center or profit center
+master services: for signed-in users the cost center and profit center tools then fall back to the journal
+entry service, without names, unless another OAuth-capable arrangement covers those services.
+The arrangement page shows which methods a scenario allows: picking OAuth 2.0 on one that does not answer
+"This scenario doesn't support this authentication method".
 
 Per-user modes are strict by default, like ARC-1's `SAP_PP_STRICT=true`: a call without a signed-in user
 (stdio, API key) is refused, and so is a `principal_propagation` destination whose Authentication is a technical one
@@ -138,7 +149,8 @@ is not used in these modes.
 1. BTP subaccount → Connectivity → Destination Trust → Generate/Export the signing certificate.
 2. S/4HANA Cloud → Communication Systems: system for the BTP subaccount with **SAML Bearer Assertion
    Provider = ON**, the exported certificate, issuer = its subject CN; inbound user with **OAuth 2.0**;
-   communication arrangement for `API_JOURNALENTRYITEMBASIC_SRV` (and the optional services) using it.
+   communication arrangement for `API_JOURNALENTRYITEMBASIC_SRV` (and the optional services) using it,
+   on a scenario that allows OAuth 2.0 (`SAP_COM_0241`, not `SAP_COM_0087`; see above).
 3. BTP destination: Type HTTP, URL `https://<tenant>-api.s4hana.cloud.sap`, Proxy Type Internet,
    Authentication **OAuth2SAMLBearerAssertion**, Audience = S/4HANA's SAML2 audience, Client Key = the
    communication user, Token Service URL `https://<tenant>-api.s4hana.cloud.sap/sap/bc/sec/oauth2/token`,
@@ -187,11 +199,42 @@ so size `S4HC_SAP_TOKEN_CHECKS_PER_SOURCE_PER_MIN` for their peak sign-ins and r
 for 5 minutes, then re-checked outside that budget, one check per token at a time; while that check is
 running or SAP does not answer (retried after 30 s), the token stays valid for up to 10 minutes after SAP
 last confirmed it. Only SAP refusing it revokes it. Each token is its own MCP session principal, so a
-session opened by one user cannot be used with another user's token. Set `S4HC_SAP_AUTH=user_token`, `S4HC_PUBLIC_URL`,
-`S4HC_SAP_OAUTH_SCOPES` (the arrangement's OAuth scopes), optional `S4HC_SAP_OAUTH_AUTHORIZE_URL`
-(default `https://<tenant>.s4hana.cloud.sap/sap/bc/sec/oauth2/authorize` — present on Gamma) and
-`S4HC_SAP_OAUTH_PKCE` (default true; verify the tenant supports PKCE). S/4HANA tokens are opaque, so this
-server cannot read the user's name; S/4HANA's own logs show it. Cannot be combined with OIDC.
+session opened by one user cannot be used with another user's token. S/4HANA tokens are opaque, so this
+server cannot read the user's name (the audit log shows `caller=sap-token:<hash>`); S/4HANA's own logs show
+it. Cannot be combined with OIDC.
+
+**Set up on S/4HANA Cloud** (as done on the Syntax Gamma tenant, 2026-11-05; needs an administrator with
+the communication management apps):
+
+1. *Communication Systems* → New: inbound only (no host name needed). Under **OAuth 2.0 Client Settings**
+   add the MCP client's redirect: for a desktop client choose **Loopback** with path `/oauth/callback`
+   (any port is accepted, so `http://127.0.0.1:<port>/oauth/callback` works).
+2. In the same system, *Users for Inbound Communication* → add a user with authentication method
+   **OAuth 2.0**, a public client (**Authorization Code + PKCE**, no secret). Its name is the OAuth client ID.
+3. *Communication Arrangements* → New, on a scenario that allows OAuth 2.0 (`SAP_COM_0241`, see above),
+   with that system and inbound user. Set the outbound services the scenario lists to inactive if it asks
+   for an outbound user.
+4. Open the arrangement's **OAuth 2.0 Details**: it shows the client ID, the authorization and token
+   endpoints and the scopes (one per service, `<SERVICE>_0001`).
+5. Each person who signs in uses their own S/4HANA login and needs the business roles the APIs check;
+   SAP refuses what their roles do not allow (`SAP_FORBIDDEN`), whatever the arrangement contains.
+
+**Set on this server:** `S4HC_SAP_AUTH=user_token`, `S4HC_PUBLIC_URL`, `S4HC_SAP_OAUTH_SCOPES` (the scopes
+from step 4, space or comma separated). Optional: `S4HC_SAP_OAUTH_AUTHORIZE_URL` (default
+`https://<tenant>.s4hana.cloud.sap/sap/bc/sec/oauth2/authorize`, the UI host), `S4HC_SAP_OAUTH_TOKEN_URL`
+(default `https://<tenant>-api.s4hana.cloud.sap/sap/public/bc/sec/oauth2/token`, the public-client token
+endpoint the arrangement shows; `S4HC_OAUTH_TOKEN_URL` is read when it is unset), `S4HC_SAP_OAUTH_PKCE`
+(default true). The metadata lists `none` as a token endpoint auth method, so a client registered as a
+public client sends no secret. Keep `S4HC_USER` / `S4HC_PASSWORD` and add `S4HC_MIXED_AUTH=true` and
+`S4HC_MCP_API_KEY` to keep the API key working beside the sign-in.
+
+**Try it with the MCP Inspector** (`npx -y @modelcontextprotocol/inspector@2.12.0` with
+`MCP_INSPECTOR_SECRET_STORE=memory`; the default keychain store drops custom header values): open it at
+`http://127.0.0.1:6274`, not `localhost`, so its redirect `http://127.0.0.1:6274/oauth/callback` matches the
+loopback rule; add `http://127.0.0.1:6274` to `S4HC_ALLOWED_ORIGINS`. Connect to `<S4HC_PUBLIC_URL>/mcp` with
+Streamable HTTP, enter the client ID, untick **Request refresh token** (the scopes above do not include
+`offline_access`), and sign in on the tenant's own login page. A client a hosted MCP platform registers
+(GenAI Studio, say) needs its own redirect URL in step 1; that variant is not verified yet.
 
 ## Verified vs. not verified
 
@@ -200,5 +243,8 @@ server cannot read the user's name; S/4HANA's own logs show it. Cannot be combin
 | OIDC resource server, 401 challenge, RFC 9728 metadata, signature/issuer/audience/expiry checks | Unit + HTTP end-to-end tests; live against Gamma with locally signed tokens (2026-11-04) |
 | Gamma's `/sap/bc/sec/oauth2/token` and `/authorize` exist; password-only user is not an OAuth client | Live probe (2026-11-04) |
 | Destination service parsing (all four ARC-1 credential shapes), PP public + private, strict refusal, per-user cache isolation | Unit tests against a faked Destination/Connectivity service |
-| A real BTP subaccount issuing per-user S/4HANA tokens for these OData APIs | **Not verified** — needs a BTP subaccount and the tenant trust setup |
-| `client_credentials` / authorization-code grants on S/4HANA Cloud for OData arrangements, PKCE | **Not verified** — needs an OAuth-enabled communication user |
+| S/4HANA sign-in (`user_token`): authorization code + PKCE with a public client on a `SAP_COM_0241` arrangement, through the MCP Inspector, with `S4HC_MIXED_AUTH` | **Verified live on Gamma (2026-11-05):** the signed-in user and the API key (communication user) got the same company code total at the same time, and only the signed-in user could read G/L line items (the communication user got `SAP_FORBIDDEN`), so SAP saw two different identities |
+| `SAP_COM_0087` cannot use OAuth 2.0 (Basic and certificate only) | Seen on Gamma's arrangement page (2026-11-05) |
+| A real BTP subaccount issuing per-user S/4HANA tokens for these OData APIs | **Not verified** — needs a BTP subaccount, the tenant trust setup and an arrangement on an OAuth-capable scenario |
+| A hosted MCP platform's redirect URL (not loopback) in the OAuth 2.0 client settings | **Not verified** |
+| `client_credentials` grant on S/4HANA Cloud for OData arrangements | **Not verified** — needs an OAuth-enabled communication user |

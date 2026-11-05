@@ -882,7 +882,11 @@ def test_http_sap_oauth_advertises_s4hana_sign_in(sap_oauth_server):
     assert meta_issuer_matches(sap_oauth_server)
     meta = requests.get(f"{sap_oauth_server}/.well-known/oauth-authorization-server").json()
     assert meta["authorization_endpoint"] == "https://my.s4hana.cloud.sap/sap/bc/sec/oauth2/authorize"
-    assert meta["token_endpoint"] == "https://my-api.s4hana.cloud.sap/sap/bc/sec/oauth2/token"
+    # S/4HANA Cloud signs business users in with public PKCE clients: the /sap/public/ token endpoint,
+    # no client secret (as on a live tenant with the MCP Inspector, 2026-11-05).
+    assert meta["token_endpoint"] == "https://my-api.s4hana.cloud.sap/sap/public/bc/sec/oauth2/token"
+    assert "none" in meta["token_endpoint_auth_methods_supported"]
+    assert meta["code_challenge_methods_supported"] == ["S256"]
     assert meta["scopes_supported"] == ["API_JOURNALENTRYITEMBASIC_SRV_0001"]
     r = requests.post(f"{sap_oauth_server}/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
                       headers={"Accept": "application/json, text/event-stream"})

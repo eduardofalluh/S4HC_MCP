@@ -325,14 +325,17 @@ class SapOAuthProvider(_AcceptsApiKeyHeader, RemoteAuthProvider):
         routes = super().get_routes(mcp_path)
         api = config.get_base_url(None)
         authorize = os.getenv("S4HC_SAP_OAUTH_AUTHORIZE_URL") or f"{api.replace('-api.', '.', 1)}/sap/bc/sec/oauth2/authorize"
-        token = os.getenv("S4HC_OAUTH_TOKEN_URL") or f"{api}/sap/bc/sec/oauth2/token"
+        # S/4HANA Cloud signs business users in through public OAuth clients (authorization code +
+        # PKCE, no secret), whose token endpoint is the /sap/public/ one (seen on a tenant, 2026-11).
+        token = (os.getenv("S4HC_SAP_OAUTH_TOKEN_URL") or os.getenv("S4HC_OAUTH_TOKEN_URL")
+                 or f"{api}/sap/public/bc/sec/oauth2/token")
         meta = {
             "issuer": public_url(),
             "authorization_endpoint": authorize,
             "token_endpoint": token,
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
-            "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
+            "token_endpoint_auth_methods_supported": ["none", "client_secret_basic", "client_secret_post"],
             "scopes_supported": _csv(os.getenv("S4HC_SAP_OAUTH_SCOPES")),
         }
         if (os.getenv("S4HC_SAP_OAUTH_PKCE", "true").lower() in ("1", "true", "yes")):
