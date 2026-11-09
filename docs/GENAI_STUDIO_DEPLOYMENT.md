@@ -31,8 +31,8 @@ python server.py --http --host 0.0.0.0 --port 8000
 Keep `MCP_TRUST_PROXY=true` (default) behind the cluster ingress so the
 internal Host header does not trip the MCP SDK's 421 check — same as CALM.
 
-Binding a non-loopback host (`--host 0.0.0.0`) requires `S4HC_MCP_API_KEY`; the
-server exits with code 2 otherwise. If GenAI Studio's platform layer already
+Binding a non-loopback host (`--host 0.0.0.0`) requires `S4HC_MCP_API_KEY` or a sign-in setup
+(`S4HC_OIDC_*` or `S4HC_SAP_AUTH=user_token`); the server exits with code 2 otherwise. If GenAI Studio's platform layer already
 authenticates every caller and you deliberately run without the key, set
 `S4HC_MCP_ALLOW_UNAUTHENTICATED=true`. Requests that carry a browser `Origin`
 header are refused unless the origin is listed in `S4HC_ALLOWED_ORIGINS`.
