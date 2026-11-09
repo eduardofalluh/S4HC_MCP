@@ -17,6 +17,7 @@ shape as the sibling `CALM_MCP` repo.
 - Live check: `python scripts/live_smoke.py` runs all 16 tools against the tenant in `S4HC_*` (read-only; prints counts and totals, never rows or credentials)
 - Lint and type-check: none configured (no ruff/flake8/mypy/pyproject in the repo)
 - Run locally: `cp .env.example .env` (fill in `S4HC_BASE_URL` + credentials), then `python server.py` (stdio) or `python server.py --http --port 8000` (Streamable HTTP at `/mcp`)
+- Container: `docker build -t s4hc-mcp .` then `docker run -p 8000:8000 -e S4HC_MCP_API_KEY=... s4hc-mcp` (non-root, config from env only). CI: `.gitlab-ci.yml` is the mcp-servers group's standard pipeline (tests, then build and push to the project registry as `:<short sha>` and `:latest` on `main`, `:<tag>` on tags)
 
 ## Architecture
 

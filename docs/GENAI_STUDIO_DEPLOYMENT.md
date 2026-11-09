@@ -4,10 +4,26 @@ Mirror of the CALM MCP deployment; only the env vars / headers differ.
 
 ## Container
 
+The GitLab pipeline (`.gitlab-ci.yml`, the mcp-servers group's standard one) runs the tests, builds the
+image and pushes it to the project's container registry: every push to `main` publishes
+`:<short commit sha>` and `:latest`, and a git tag `vX.Y.Z` publishes `:vX.Y.Z`.
+
+```bash
+# image in the mcp-servers group (pull the :latest or a pinned :<sha> / :<tag>)
+registry.gitlab.com/syntax-cloud/cloudadmin/genai/third-parties/mcp-servers/mcp-sap-s4hana-cloud:latest
+
+# run it: port 8000, endpoint http://<service>:8000/mcp (Streamable HTTP)
+docker run -p 8000:8000 -e S4HC_MCP_API_KEY=... <image>
+```
+
+The image runs `python server.py --http --host 0.0.0.0 --port 8000` as a non-root user (uid 10001), holds
+no `.env` file or credential, and has a health check on port 8000. All configuration comes from the
+environment variables below. Without `S4HC_MCP_API_KEY` (or `S4HC_MCP_ALLOW_UNAUTHENTICATED=true`) the
+container exits at once with code 2. Without the image, the same server runs with:
+
 ```bash
 pip install -r requirements.txt
 python server.py --http --host 0.0.0.0 --port 8000
-# endpoint: http://<service>:8000/mcp   (Streamable HTTP)
 ```
 
 Keep `MCP_TRUST_PROXY=true` (default) behind the cluster ingress so the
