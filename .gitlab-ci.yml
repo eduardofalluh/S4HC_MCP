@@ -1,6 +1,7 @@
 # The mcp-servers group's standard image pipeline (as in mcp-sap-notes, itglue-mcp-server and
 # studio-mcp-server), with the test suite run first: every push to main builds the image, pushes it to
 # this project's container registry as :<short sha> and :latest, and a git tag publishes :<tag>.
+# Build and release run `on_success` (the standard's `always` would publish an image whose tests failed).
 image: docker:20
 
 services:
@@ -49,9 +50,9 @@ Build:
   stage: build
   rules:
   - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"
-    when: always
+    when: on_success
   - if: $CI_COMMIT_TAG
-    when: always
+    when: on_success
   - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     when: manual
     allow_failure: true
@@ -74,7 +75,7 @@ release latest:
   stage: release
   rules:
   - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"
-    when: always
+    when: on_success
   script:
   - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
   - docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA $CI_REGISTRY_IMAGE:latest
@@ -87,7 +88,7 @@ release tag:
   stage: release
   rules:
   - if: $CI_COMMIT_TAG
-    when: always
+    when: on_success
   script:
   - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
   - docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_NAME

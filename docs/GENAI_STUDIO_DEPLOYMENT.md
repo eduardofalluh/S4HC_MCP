@@ -16,10 +16,12 @@ registry.gitlab.com/syntax-cloud/cloudadmin/genai/third-parties/mcp-servers/mcp-
 docker run -p 8000:8000 -e S4HC_MCP_API_KEY=... <image>
 ```
 
-The image runs `python server.py --http --host 0.0.0.0 --port 8000` as a non-root user (uid 10001), holds
-no `.env` file or credential, and has a health check on port 8000. All configuration comes from the
-environment variables below. Without `S4HC_MCP_API_KEY` (or `S4HC_MCP_ALLOW_UNAUTHENTICATED=true`) the
-container exits at once with code 2. Without the image, the same server runs with:
+The image runs `python server.py --http` on `MCP_HOST=0.0.0.0` / `MCP_PORT=8000` (override either with
+the environment variable) as a non-root user (uid 10001), holds no `.env` file or credential, and has a
+health check on that port. All configuration comes from the environment variables below. Without
+`S4HC_MCP_API_KEY`, a sign-in setup (`S4HC_OIDC_*` or `S4HC_SAP_AUTH=user_token`) or
+`S4HC_MCP_ALLOW_UNAUTHENTICATED=true`, the container exits at once with code 2. Without the image, the same
+server runs with:
 
 ```bash
 pip install -r requirements.txt
