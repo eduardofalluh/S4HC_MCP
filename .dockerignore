@@ -1,0 +1,32 @@
+# Only requirements.txt, server.py and src/ are copied; this keeps everything else, and above all
+# secrets, out of the build context. The **/ patterns match at any depth, including inside src/.
+.git
+.gitignore
+.gitlab-ci.yml
+.claude/
+.stx/
+
+# Secrets and local settings
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.pfx
+**/*.p12
+
+# Python and tooling
+venv/
+.venv/
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+**/*.log
+
+# Not needed at runtime
+tests/
+scripts/
+docs/
+*.md
+Dockerfile
+.dockerignore
+**/.DS_Store
