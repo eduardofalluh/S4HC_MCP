@@ -23,7 +23,9 @@ credentials to a host named in a request, and only accepts API hosts ending in `
 (default `.s4hana.cloud.sap,.s4hana.ondemand.com`).
 
 Plus, like CALM, the optional `x-user-email` header (`{{user.email}}` in GenAI
-Studio) is recorded as the caller in the audit log.
+Studio) is recorded in the audit log as `claimed_caller` on calls without a verified identity (API key,
+tenant headers). It is what the client says, not a checked identity: `caller` holds only identities this
+server verified (a signed-in user's token), and the header is not logged when there is one.
 
 **Deployment-level (set once on the server, not per connection):**
 
@@ -40,7 +42,8 @@ Studio) is recorded as the caller in the audit log.
 Server-side knobs that are **not** per-connection inputs: `S4HC_RATE_LIMIT_PER_MIN`
 (120, per connection), `S4HC_RATE_LIMIT_GLOBAL_PER_MIN` (600, shared by trusted connections: the server's
 own credentials and any credential SAP has answered 2xx for), `S4HC_RATE_LIMIT_UNVERIFIED_PER_MIN` (60, shared
-by all credentials SAP has not accepted yet, so invented ones cannot crowd out real tenants), `S4HC_PAGE_SIZE` (1000), `S4HC_MAX_ROWS`
+by all credentials SAP has not accepted yet, so invented ones cannot crowd out real tenants; each such connection
+gets at most a quarter of it, 15 per minute at the defaults, so one cannot block every new tenant's first calls), `S4HC_PAGE_SIZE` (1000), `S4HC_MAX_ROWS`
 (50000), `S4HC_MAX_INLINE_ROWS` (5000 raw rows per response), `S4HC_MAX_PAGES` (100),
 `S4HC_REQUEST_DEADLINE_SECONDS` (120, one paged read including retries), `S4HC_MASTER_CACHE_TTL` (600 s),
 `S4HC_MAX_CACHED_CONNECTIONS` (64), `S4HC_MAX_CACHED_RESULTS` (512), `MCP_HOST`, `MCP_PORT`,

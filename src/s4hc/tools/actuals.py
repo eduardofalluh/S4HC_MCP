@@ -234,8 +234,9 @@ def envelope(source: str, *, truncated: bool = False, warnings: list[str] | None
     status = "partial" if truncated else "complete"
     w = list(warnings or [])
     if assumed_year is not None:
-        w.append(f"fiscal_year was not given, so {assumed_year}, the calendar year, was assumed (fiscal year "
-                 "variant K4). If the company code uses another variant (fiscal_context shows it), pass fiscal_year.")
+        w.append(f"No fiscal year was given, so {assumed_year}, the calendar year, was assumed (fiscal year "
+                 "variant K4). If the company code uses another variant (fiscal_context shows it), pass the fiscal "
+                 "year explicitly.")
     if truncated:
         w.append("Rows were capped; totals in this response cover only the returned rows.")
     return {

@@ -619,7 +619,7 @@ def test_audit_never_logs_a_header_as_the_verified_caller(caplog):
     assert asyncio.run(mw.on_call_tool(context, call_next)) == "ok"
     line = next(r.getMessage() for r in caplog.records if r.name == "s4hc-mcp.audit")
     assert "caller=None " in line
-    assert "claimed_caller=user@example.com_outcome=ok " in line
+    assert "claimed_caller=user@example.com_outcome_ok " in line  # no "=" left to forge a field with
 
 
 def test_a_refused_call_uses_no_budget_and_unverified_connections_get_a_share(monkeypatch):
@@ -633,6 +633,8 @@ def test_a_refused_call_uses_no_budget_and_unverified_connections_get_a_share(mo
     mw = governance.AuditAndRateLimitMiddleware()
     assert mw._bucket("new-tenant", mw._unverified_buckets).per_minute == 15  # a quarter of the shared 60
     assert mw._bucket("known-tenant").per_minute == mw.per_connection
+    monkeypatch.setenv("S4HC_RATE_LIMIT_PER_MIN", "0")  # unlimited per trusted connection
+    assert governance.AuditAndRateLimitMiddleware().unverified_per_connection == 15
 
 
 def test_an_amount_that_is_not_a_number_is_refused_not_zeroed():
@@ -647,6 +649,6 @@ def test_an_amount_that_is_not_a_number_is_refused_not_zeroed():
 
 
 def test_a_defaulted_fiscal_year_is_said_in_the_result(tool):
-    said = lambda out: any("fiscal_year was not given" in w for w in out["completeness"]["warnings"])  # noqa: E731
+    said = lambda out: any("No fiscal year was given" in w for w in out["completeness"]["warnings"])  # noqa: E731
     assert said(tool("cost_center_summary")(ctx=None, cost_centers=["CC100"]))
     assert not said(tool("cost_center_summary")(ctx=None, fiscal_year=2026, cost_centers=["CC100"]))

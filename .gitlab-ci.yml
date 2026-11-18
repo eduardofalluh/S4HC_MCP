@@ -40,7 +40,7 @@ Tests:
   - docker start -a "$TEST_CONTAINER"
   # Runs whatever failed above, so no test container is left on the shared runner host.
   after_script:
-  - docker rm -f "s4hc-tests-$CI_JOB_ID" >/dev/null 2>&1 || true
+  - docker rm -f "$TEST_CONTAINER" >/dev/null 2>&1 || true
 
 .image_template:
   image: docker:20

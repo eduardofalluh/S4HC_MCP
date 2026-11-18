@@ -199,7 +199,7 @@ def _claimed(value: str | None) -> str | None:
     so it cannot forge other fields of the line."""
     if not value:
         return None
-    return "".join(c if c.isprintable() and not c.isspace() else "_" for c in value)[:64]
+    return "".join(c if c.isprintable() and not c.isspace() and c != "=" else "_" for c in value)[:64]
 
 
 class AuditAndRateLimitMiddleware(Middleware):
@@ -221,8 +221,9 @@ class AuditAndRateLimitMiddleware(Middleware):
         self.global_bucket = _TokenBucket(int(os.getenv("S4HC_RATE_LIMIT_GLOBAL_PER_MIN", "600")))
         unverified = int(os.getenv("S4HC_RATE_LIMIT_UNVERIFIED_PER_MIN", "60"))
         self.unverified_bucket = _TokenBucket(unverified)
-        self.unverified_per_connection = (min(self.per_connection, max(1, unverified // 4)) if unverified > 0
-                                          else self.per_connection)
+        share = max(1, unverified // 4)  # S4HC_RATE_LIMIT_PER_MIN=0 (unlimited) still leaves this share
+        self.unverified_per_connection = ((min(self.per_connection, share) if self.per_connection > 0 else share)
+                                          if unverified > 0 else self.per_connection)
         self._buckets: OrderedDict[str, _TokenBucket] = OrderedDict()
         self._unverified_buckets: OrderedDict[str, _TokenBucket] = OrderedDict()
         self._lock = threading.Lock()
@@ -249,15 +250,17 @@ class AuditAndRateLimitMiddleware(Middleware):
         ctx = context.fastmcp_context
         from .dependencies import caller_identity
 
-        # caller= is only ever a verified identity (a token's subject); what a client claims in a header is
-        # logged apart as claimed_caller=, so it can never pass for a checked identity.
+        # caller= is only ever a verified identity (a token's subject). Without one, what a client claims in
+        # a header is logged apart as claimed_caller=, so it can never pass for a checked identity; with one,
+        # the header (personal data) is not logged at all.
         caller = caller_identity(ctx)
         claimed = None
-        try:
-            req = ctx.request_context.request  # type: ignore[union-attr]
-            claimed = _claimed(req.headers.get("x-user-email") or req.headers.get("x-s4hc-user"))
-        except Exception:  # noqa: BLE001
-            pass
+        if caller is None:
+            try:
+                req = ctx.request_context.request  # type: ignore[union-attr]
+                claimed = _claimed(req.headers.get("x-user-email") or req.headers.get("x-s4hc-user"))
+            except Exception:  # noqa: BLE001
+                pass
         conn, trusted = rate_limit_key(ctx)
         if trusted:
             allowed = allow_all(self._bucket(conn), self.global_bucket)
