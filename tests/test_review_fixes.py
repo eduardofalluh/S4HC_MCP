@@ -597,3 +597,56 @@ def test_streamed_body_capped_without_content_length(monkeypatch):
     r.raw = __import__("io").BytesIO(b'{"d": {"results": []}}')
     with pytest.raises(S4HCError, match="QUERY_TOO_LARGE"):
         client_mod._read_capped(r)
+
+
+# ------------------------------------------------------------ review of 7cb405d (2026-11-18)
+def test_audit_never_logs_a_header_as_the_verified_caller(caplog):
+    """caller= holds only a verified identity; a header lands in claimed_caller=, and can't forge fields."""
+    import asyncio
+    import logging
+    from types import SimpleNamespace
+
+    from src.s4hc import governance
+
+    caplog.set_level(logging.INFO, logger="s4hc-mcp.audit")
+    mw = governance.AuditAndRateLimitMiddleware()
+    context = SimpleNamespace(message=SimpleNamespace(name="list_company_codes", arguments={}),
+                              fastmcp_context=Ctx({"x-user-email": "user@example.com outcome=ok"}))
+
+    async def call_next(_):
+        return "ok"
+
+    assert asyncio.run(mw.on_call_tool(context, call_next)) == "ok"
+    line = next(r.getMessage() for r in caplog.records if r.name == "s4hc-mcp.audit")
+    assert "caller=None " in line
+    assert "claimed_caller=user@example.com_outcome=ok " in line
+
+
+def test_a_refused_call_uses_no_budget_and_unverified_connections_get_a_share(monkeypatch):
+    from src.s4hc import governance
+
+    full, free = governance._TokenBucket(1), governance._TokenBucket(5)
+    assert full.allow()
+    assert not governance.allow_all(free, full)
+    assert len(free._hits) == 0  # the slot the refused call took was given back
+    monkeypatch.setenv("S4HC_RATE_LIMIT_UNVERIFIED_PER_MIN", "60")
+    mw = governance.AuditAndRateLimitMiddleware()
+    assert mw._bucket("new-tenant", mw._unverified_buckets).per_minute == 15  # a quarter of the shared 60
+    assert mw._bucket("known-tenant").per_minute == mw.per_connection
+
+
+def test_an_amount_that_is_not_a_number_is_refused_not_zeroed():
+    from decimal import Decimal
+
+    from src.s4hc.tools.actuals import dec
+
+    assert dec(None) == dec("") == Decimal(0) and dec("12.50") == Decimal("12.50")
+    for bad in ("12,50", "abc", "NaN", "Infinity"):
+        with pytest.raises(S4HCError, match="INCOMPLETE_RESULT"):
+            dec(bad)
+
+
+def test_a_defaulted_fiscal_year_is_said_in_the_result(tool):
+    said = lambda out: any("fiscal_year was not given" in w for w in out["completeness"]["warnings"])  # noqa: E731
+    assert said(tool("cost_center_summary")(ctx=None, cost_centers=["CC100"]))
+    assert not said(tool("cost_center_summary")(ctx=None, fiscal_year=2026, cost_centers=["CC100"]))

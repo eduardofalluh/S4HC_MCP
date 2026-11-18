@@ -1,7 +1,10 @@
-# Pinned to the versions the 57-test suite was run against (2026-10-19).
+# Pinned to the versions the test suite runs against (225 tests, 2026-11-18). starlette and anyio are
+# imported directly (server.py, inbound_auth.py), so they are pinned too rather than left to fastmcp.
 fastmcp==4.1.1
 requests==2.34.2
 python-dotenv==1.2.3
+starlette==1.9.0
+anyio==4.15.1
 
 # Test only
 pytest==9.1.1

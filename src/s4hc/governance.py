@@ -158,16 +158,48 @@ class _TokenBucket:
         self._lock = threading.Lock()
 
     def allow(self) -> bool:
+        return self.take() is not None
+
+    def take(self) -> float | None:
+        """Use one slot: its timestamp (to give back), or None when the bucket is full."""
         if self.per_minute <= 0:
-            return True
+            return 0.0
         now = time.monotonic()
         with self._lock:
             while self._hits and now - self._hits[0] > 60:
                 self._hits.popleft()
             if len(self._hits) >= self.per_minute:
-                return False
+                return None
             self._hits.append(now)
-            return True
+            return now
+
+    def give_back(self, slot: float) -> None:
+        with self._lock:
+            try:
+                self._hits.remove(slot)
+            except ValueError:
+                pass
+
+
+def allow_all(*buckets: _TokenBucket) -> bool:
+    """One slot in every bucket, or none: a refused call uses up no budget anywhere."""
+    taken: list[tuple[_TokenBucket, float]] = []
+    for bucket in buckets:
+        slot = bucket.take()
+        if slot is None:
+            for b, s in taken:
+                b.give_back(s)
+            return False
+        taken.append((bucket, slot))
+    return True
+
+
+def _claimed(value: str | None) -> str | None:
+    """A caller-sent header for the audit line: never taken as an identity, and kept to one short token
+    so it cannot forge other fields of the line."""
+    if not value:
+        return None
+    return "".join(c if c.isprintable() and not c.isspace() else "_" for c in value)[:64]
 
 
 class AuditAndRateLimitMiddleware(Middleware):
@@ -176,26 +208,32 @@ class AuditAndRateLimitMiddleware(Middleware):
     Trusted connections (the server's own env credentials, or credentials SAP has
     answered 2xx for) get S4HC_RATE_LIMIT_PER_MIN (120) each and share
     S4HC_RATE_LIMIT_GLOBAL_PER_MIN (600). Unverified connections get the same
-    per-connection limit but all share S4HC_RATE_LIMIT_UNVERIFIED_PER_MIN (60),
-    in a separate bounded map: invented credentials can neither drain the
-    trusted budget nor evict a trusted connection's bucket."""
+    share S4HC_RATE_LIMIT_UNVERIFIED_PER_MIN (60), each with at most a quarter of
+    it, in a separate bounded map: invented credentials can neither drain the
+    trusted budget nor evict a trusted connection's bucket, and one unverified
+    connection cannot use up the shared budget that every new tenant's first
+    calls need."""
 
     MAX_BUCKETS = 1024
 
     def __init__(self) -> None:
         self.per_connection = int(os.getenv("S4HC_RATE_LIMIT_PER_MIN", "120"))
         self.global_bucket = _TokenBucket(int(os.getenv("S4HC_RATE_LIMIT_GLOBAL_PER_MIN", "600")))
-        self.unverified_bucket = _TokenBucket(int(os.getenv("S4HC_RATE_LIMIT_UNVERIFIED_PER_MIN", "60")))
+        unverified = int(os.getenv("S4HC_RATE_LIMIT_UNVERIFIED_PER_MIN", "60"))
+        self.unverified_bucket = _TokenBucket(unverified)
+        self.unverified_per_connection = (min(self.per_connection, max(1, unverified // 4)) if unverified > 0
+                                          else self.per_connection)
         self._buckets: OrderedDict[str, _TokenBucket] = OrderedDict()
         self._unverified_buckets: OrderedDict[str, _TokenBucket] = OrderedDict()
         self._lock = threading.Lock()
 
     def _bucket(self, key: str, buckets: OrderedDict[str, _TokenBucket] | None = None) -> _TokenBucket:
+        unverified = buckets is not None
         buckets = self._buckets if buckets is None else buckets
         with self._lock:
             b = buckets.get(key)
             if b is None:
-                b = buckets[key] = _TokenBucket(self.per_connection)
+                b = buckets[key] = _TokenBucket(self.unverified_per_connection if unverified else self.per_connection)
                 while len(buckets) > self.MAX_BUCKETS:
                     buckets.popitem(last=False)
             else:
@@ -211,19 +249,21 @@ class AuditAndRateLimitMiddleware(Middleware):
         ctx = context.fastmcp_context
         from .dependencies import caller_identity
 
-        caller = caller_identity(ctx)  # a verified token's subject wins over any header
-        if caller is None:
-            try:
-                req = ctx.request_context.request  # type: ignore[union-attr]
-                caller = req.headers.get("x-user-email") or req.headers.get("x-s4hc-user")
-            except Exception:  # noqa: BLE001
-                pass
+        # caller= is only ever a verified identity (a token's subject); what a client claims in a header is
+        # logged apart as claimed_caller=, so it can never pass for a checked identity.
+        caller = caller_identity(ctx)
+        claimed = None
+        try:
+            req = ctx.request_context.request  # type: ignore[union-attr]
+            claimed = _claimed(req.headers.get("x-user-email") or req.headers.get("x-s4hc-user"))
+        except Exception:  # noqa: BLE001
+            pass
         conn, trusted = rate_limit_key(ctx)
         if trusted:
-            allowed = self._bucket(conn).allow() and self.global_bucket.allow()
+            allowed = allow_all(self._bucket(conn), self.global_bucket)
         else:
-            allowed = self.unverified_bucket.allow() and self._bucket(conn, self._unverified_buckets).allow()
-        tag = f"conn={conn[:8]} trusted={trusted}"
+            allowed = allow_all(self.unverified_bucket, self._bucket(conn, self._unverified_buckets))
+        tag = f"conn={conn[:8]} trusted={trusted}" + (f" claimed_caller={claimed}" if claimed else "")
         if not allowed:
             log.warning("audit tool=%s caller=%s %s outcome=rate_limited", name, caller, tag)
             raise S4HCError("Rate limit exceeded for this connection; retry in a minute", "SAP_RATE_LIMITED")

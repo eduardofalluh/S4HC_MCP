@@ -40,7 +40,7 @@ from starlette.routing import Route
 from . import config
 from .client import HeaderAuth
 from .errors import S4HCError
-from .governance import _TokenBucket
+from .governance import _TokenBucket, allow_all
 from .sap_auth import _https
 
 CLOCK_SKEW_SECONDS = 60
@@ -233,7 +233,7 @@ class SapUserTokenVerifier(TokenVerifier):
             return None
         try:
             # The sender's own share first, so a sender over it does not use up the shared budget.
-            if not self._source_bucket(source).allow() or not self._checks.allow():
+            if not allow_all(self._source_bucket(source), self._checks):
                 log.warning("S/4HANA token check refused without asking SAP: per-minute budget used up")
                 return None
             return await anyio.to_thread.run_sync(self._check, token)

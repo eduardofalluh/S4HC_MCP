@@ -148,7 +148,7 @@ def register(mcp: FastMCP) -> None:
         out.sort(key=lambda x: -abs(Decimal(x["Amount"])))
         currencies = sorted({str(x["Currency"]) for x in out if x.get("Currency")})
         return {
-            **envelope(f"{GLLINEITEM_SERVICE}/{disc['entity_set']}", truncated=truncated),
+            **envelope(f"{GLLINEITEM_SERVICE}/{disc['entity_set']}", assumed_year=None if fiscal_year else fy, truncated=truncated),
             "cost_center": cost_center, "ledger": ledger or get_defaults(ctx).ledger, "currency": currencies, "fiscal_year": fy, "periods": [period_from, period_to],
             "count": len(out), "truncated": truncated,
             "total": str(sum((Decimal(x["Amount"]) for x in out), Decimal(0))) if len(currencies) <= 1 else None,

@@ -20,8 +20,20 @@ The image runs `python server.py --http` on `MCP_HOST=0.0.0.0` / `MCP_PORT=8000`
 the environment variable) as a non-root user (uid 10001), holds no `.env` file or credential, and has a
 health check on that port. All configuration comes from the environment variables below. Without
 `S4HC_MCP_API_KEY`, a sign-in setup (`S4HC_OIDC_*` or `S4HC_SAP_AUTH=user_token`) or
-`S4HC_MCP_ALLOW_UNAUTHENTICATED=true`, the container exits at once with code 2. Without the image, the same
-server runs with:
+`S4HC_MCP_ALLOW_UNAUTHENTICATED=true`, the container exits at once with code 2.
+
+On Kubernetes (AKS), the Docker `HEALTHCHECK` is ignored and the server has no health route, so give the
+container TCP probes on its port:
+
+```yaml
+livenessProbe:  { tcpSocket: { port: 8000 }, initialDelaySeconds: 15, periodSeconds: 30 }
+readinessProbe: { tcpSocket: { port: 8000 }, initialDelaySeconds: 5,  periodSeconds: 10 }
+```
+
+Main and tag pipelines publish `:<short sha>` (then `:latest` or `:<tag>`); a manual build in a merge
+request publishes `:mr-<iid>-<short sha>`, so deploy `:latest`, a tag or a main commit's `:<short sha>`.
+
+Without the image, the same server runs with:
 
 ```bash
 pip install -r requirements.txt

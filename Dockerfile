@@ -29,7 +29,8 @@ USER 10001
 EXPOSE 8000
 
 # The server has no health route; a refused connection means it is down. Dial MCP_HOST itself unless it
-# is a wildcard address, which listens on loopback too.
+# is a wildcard address, which listens on loopback too. Kubernetes ignores HEALTHCHECK: give the pod a
+# tcpSocket liveness and readiness probe on port 8000 instead (docs/GENAI_STUDIO_DEPLOYMENT.md).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python -c "import os, socket; h = os.environ['MCP_HOST']; socket.create_connection(('127.0.0.1' if h in ('0.0.0.0', '::', '') else h, int(os.environ['MCP_PORT'])), 3).close()"
 

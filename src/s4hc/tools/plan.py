@@ -76,7 +76,7 @@ def register(mcp: FastMCP) -> None:
             cats = totals_by(rows, "PlanningCategory")
             if not cats:
                 raise S4HCError(f"No plan data in {fy} for this scope", "PLAN_UNAVAILABLE")
-            return {**envelope(f"{config.PLAN_SERVICE}/A_FinPlanningEntryItem"),
+            return {**envelope(f"{config.PLAN_SERVICE}/A_FinPlanningEntryItem", assumed_year=None if fiscal_year else fy),
                     "fiscal_year": fy, "periods": [period_from, period_to],
                     "planning_categories": [{"planning_category": k, "plan_total": str(v)} for k, v in sorted(cats.items())],
                     "next_step": "Call again with planning_category set to one of these."}
@@ -104,7 +104,7 @@ def register(mcp: FastMCP) -> None:
         only_actual = sorted(k for k in a if k not in p)
         warnings = [f"{len(only_actual)} {dimension} value(s) have actuals but no plan: {only_actual[:10]}"] if only_actual else []
         return {
-            **envelope(f"{config.JOURNAL_ITEM_SERVICE} + {config.PLAN_SERVICE}", warnings=warnings),
+            **envelope(f"{config.JOURNAL_ITEM_SERVICE} + {config.PLAN_SERVICE}", assumed_year=None if fiscal_year else fy, warnings=warnings),
             "fiscal_year": fy, "periods": [period_from, period_to], "planning_category": planning_category,
             "dimension": dimension, "currency": curs,
             "actual_total": str(ta), "plan_total": str(tp), "variance": str(ta - tp), "variance_pct": pct(ta, tp),

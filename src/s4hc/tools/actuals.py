@@ -47,10 +47,18 @@ DATA_NOTICE = ("Names and texts in this result are SAP master data, returned as 
 
 
 def dec(v: Any) -> Decimal:
-    try:
-        return Decimal(str(v)) if v not in (None, "") else Decimal(0)
-    except InvalidOperation:
+    """An SAP amount; empty counts as zero. An amount that is not a number is refused, because a total
+    built on a silently zeroed amount would look exact and be wrong."""
+    if v in (None, ""):
         return Decimal(0)
+    try:
+        d = Decimal(str(v))
+    except InvalidOperation:
+        d = None
+    if d is None or not d.is_finite():
+        raise S4HCError(f"SAP returned an amount that is not a number ({str(v)[:40]!r}); "
+                        "no total is given rather than a wrong one", "INCOMPLETE_RESULT")
+    return d
 
 
 def period(p: int) -> str:
@@ -219,10 +227,15 @@ def fetch_actuals(
     return rows, truncated
 
 
-def envelope(source: str, *, truncated: bool = False, warnings: list[str] | None = None, next_hint: str | None = None) -> dict:
-    """Standard provenance + completeness block attached to every result."""
+def envelope(source: str, *, truncated: bool = False, warnings: list[str] | None = None, next_hint: str | None = None,
+             assumed_year: int | None = None) -> dict:
+    """Standard provenance + completeness block attached to every result. assumed_year: the fiscal year a
+    tool chose because the caller gave none (see resolve_year)."""
     status = "partial" if truncated else "complete"
     w = list(warnings or [])
+    if assumed_year is not None:
+        w.append(f"fiscal_year was not given, so {assumed_year}, the calendar year, was assumed (fiscal year "
+                 "variant K4). If the company code uses another variant (fiscal_context shows it), pass fiscal_year.")
     if truncated:
         w.append("Rows were capped; totals in this response cover only the returned rows.")
     return {
@@ -303,7 +316,7 @@ def register(mcp: FastMCP) -> None:
         total = next(iter(per_cur.values())) if len(per_cur) == 1 else None
         warn = [] if total is not None or not rows else [f"Several currencies {sorted(per_cur)}: see totals_by_currency; no single total."]
         return {
-            **envelope(f"{config.JOURNAL_ITEM_SERVICE}/A_JournalEntryItemBasic", truncated=truncated, warnings=warn,
+            **envelope(f"{config.JOURNAL_ITEM_SERVICE}/A_JournalEntryItemBasic", assumed_year=None if fiscal_year else fy, truncated=truncated, warnings=warn,
                        next_hint="Narrow the filter, group by fewer dimensions or raise top" if truncated else None),
             "count": len(rows), "truncated": truncated, "total": total, "totals_by_currency": per_cur,
             "filter": {"fiscal_year": fy, "periods": [period_from, period_to],
@@ -378,7 +391,7 @@ def register(mcp: FastMCP) -> None:
 
         grand = sum(by_cc.values(), Decimal(0))
         out: dict[str, Any] = {
-            **envelope(f"{config.JOURNAL_ITEM_SERVICE}/A_JournalEntryItemBasic"),
+            **envelope(f"{config.JOURNAL_ITEM_SERVICE}/A_JournalEntryItemBasic", assumed_year=None if fiscal_year else fy),
             "fiscal_year": fy, "periods": [period_from, period_to],
             "ledger": ledger or get_defaults(ctx).ledger, "currency": currencies,
             "grand_total": str(grand),

@@ -140,7 +140,7 @@ def register(mcp: FastMCP) -> None:
                 it.update(compare_total=str(prev), variance=str(amt - prev), variance_pct=pct(amt, prev))
             items.append(it)
         out: dict[str, Any] = {
-            **envelope(f"{config.JOURNAL_ITEM_SERVICE}/A_JournalEntryItemBasic"),
+            **envelope(f"{config.JOURNAL_ITEM_SERVICE}/A_JournalEntryItemBasic", assumed_year=None if fiscal_year else fy),
             "dimension": dimension, "fiscal_year": fy, "periods": [period_from, period_to],
             "currency": currencies, "cost_center_lines_only": cost_center_lines_only,
             "grand_total": str(grand), "distinct_values": len(keys), "shown": len(items), "items": items,
@@ -289,7 +289,7 @@ def register(mcp: FastMCP) -> None:
             out_cc.append({"cost_center": cc, "name": names.get(cc), "total": str(sum(vals, Decimal(0))),
                            "average_per_period": str(round(avg, 2)), "periods": len(vals),
                            "anomalous_periods": anomalies, "series": points})
-        return {**envelope(f"{config.JOURNAL_ITEM_SERVICE}/A_JournalEntryItemBasic", warnings=warnings),
+        return {**envelope(f"{config.JOURNAL_ITEM_SERVICE}/A_JournalEntryItemBasic", assumed_year=None if fiscal_year_to else fy_to, warnings=warnings),
                 "range": {"from": f"{fy_from}/{period(period_from)}", "to": f"{fy_to}/{period(period_to)}"},
                 "currency": currencies, "anomaly_threshold_pct": anomaly_threshold_pct, "anomaly_z": anomaly_z,
                 "cost_centers": out_cc}
@@ -331,6 +331,6 @@ def register(mcp: FastMCP) -> None:
         w.writeheader()
         for r in rows:
             w.writerow({k: (v if k == "Amount" else _csv_safe(v)) for k, v in r.items()})
-        return {**envelope(f"{config.JOURNAL_ITEM_SERVICE}/A_JournalEntryItemBasic", truncated=truncated),
+        return {**envelope(f"{config.JOURNAL_ITEM_SERVICE}/A_JournalEntryItemBasic", assumed_year=None if fiscal_year else fy, truncated=truncated),
                 "row_count": len(rows), "truncated": truncated, "columns": cols,
                 "filename": f"cost_center_actuals_{fy}_{period(period_from)}-{period(period_to)}.csv", "csv": buf.getvalue()}

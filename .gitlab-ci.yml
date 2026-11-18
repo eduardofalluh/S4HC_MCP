@@ -2,6 +2,8 @@
 # studio-mcp-server), with the test suite run first: every push to main builds the image, pushes it to
 # this project's container registry as :<short sha> and :latest, and a git tag publishes :<tag>.
 # Build and release run `on_success` (the standard's `always` would publish an image whose tests failed).
+# image/services apply on docker-executor runners (gitlab.com's, as in genie-suite); the group's shell
+# runners ignore them and use the host's Docker.
 image: docker:20
 
 services:
@@ -10,7 +12,6 @@ services:
 variables:
   DOCKER_TLS_CERTDIR: ""
   DOCKER_DRIVER: overlay2
-  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
 
 stages:
 - test
@@ -29,20 +30,24 @@ Tests:
     when: always
   - if: $CI_COMMIT_TAG
     when: always
+  variables:
+    TEST_CONTAINER: s4hc-tests-$CI_JOB_ID
   script:
   - >
-    TEST_CONTAINER=$(docker create python:3.14.8-slim
-    sh -c "cd /src && pip install -q -r requirements.txt && python -m pytest tests -q -p no:cacheprovider")
+    docker create --name "$TEST_CONTAINER" python:3.14.8-slim
+    sh -c "cd /src && pip install -q -r requirements.txt && python -m pytest tests -q -p no:cacheprovider"
   - docker cp . "$TEST_CONTAINER:/src"
-  - docker start -a "$TEST_CONTAINER" || { docker rm -f "$TEST_CONTAINER"; exit 1; }
-  - docker rm -f "$TEST_CONTAINER"
+  - docker start -a "$TEST_CONTAINER"
+  # Runs whatever failed above, so no test container is left on the shared runner host.
+  after_script:
+  - docker rm -f "s4hc-tests-$CI_JOB_ID" >/dev/null 2>&1 || true
 
 .image_template:
   image: docker:20
   services:
   - docker:20.10.16-dind
   before_script:
-  - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
 
 Build:
   extends: .image_template
@@ -56,6 +61,8 @@ Build:
     when: manual
     allow_failure: true
   script:
+  # :<short sha> on main and tags (the release jobs retag it); :mr-<iid>-<short sha> for a merge request.
+  - IMAGE_REF="$CI_REGISTRY_IMAGE:${CI_MERGE_REQUEST_IID:+mr-$CI_MERGE_REQUEST_IID-}$CI_COMMIT_SHORT_SHA"
   - docker pull $CI_REGISTRY_IMAGE:latest || true
   - >
     docker build --pull --cache-from $CI_REGISTRY_IMAGE:latest
@@ -64,8 +71,8 @@ Build:
     --label "com.syntax.genai.image.created=$CI_JOB_STARTED_AT"
     --label "com.syntax.genai.image.revision=$CI_COMMIT_SHA"
     --label "com.syntax.genai.image.version=$CI_COMMIT_REF_NAME"
-    --tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA .
-  - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+    --tag "$IMAGE_REF" .
+  - docker push "$IMAGE_REF"
 
 release latest:
   extends: .image_template
