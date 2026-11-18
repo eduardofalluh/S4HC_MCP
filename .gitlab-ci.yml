@@ -17,16 +17,11 @@ stages:
 - build
 - release
 
+# The group's runners are shell executors: they ignore `image:` and run on a host with Python 3.10 and
+# Docker. So the tests run in a python:3.14.8-slim container (the image's Python), and nothing is installed
+# on the runner. `docker cp` instead of a bind mount also works with docker-in-docker on other runners.
 Tests:
   stage: test
-  image: python:3.14.8-slim
-  services: []
-  variables:
-    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
-  cache:
-    key: pip
-    paths:
-    - .cache/pip
   rules:
   - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"
     when: always
@@ -35,8 +30,12 @@ Tests:
   - if: $CI_COMMIT_TAG
     when: always
   script:
-  - pip install -r requirements.txt
-  - python -m pytest tests -q
+  - >
+    TEST_CONTAINER=$(docker create python:3.14.8-slim
+    sh -c "cd /src && pip install -q -r requirements.txt && python -m pytest tests -q -p no:cacheprovider")
+  - docker cp . "$TEST_CONTAINER:/src"
+  - docker start -a "$TEST_CONTAINER" || { docker rm -f "$TEST_CONTAINER"; exit 1; }
+  - docker rm -f "$TEST_CONTAINER"
 
 .image_template:
   image: docker:20
