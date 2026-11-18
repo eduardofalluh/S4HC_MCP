@@ -1,0 +1,101 @@
+# The mcp-servers group's standard image pipeline (as in mcp-sap-notes, itglue-mcp-server and
+# studio-mcp-server), with the test suite run first: every push to main builds the image, pushes it to
+# this project's container registry as :<short sha> and :latest, and a git tag publishes :<tag>.
+# Build and release run `on_success` (the standard's `always` would publish an image whose tests failed).
+# image/services apply on docker-executor runners (gitlab.com's, as in genie-suite); the group's shell
+# runners ignore them and use the host's Docker.
+image: docker:20
+
+services:
+- docker:20.10.16-dind
+
+variables:
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_DRIVER: overlay2
+
+stages:
+- test
+- build
+- release
+
+# The group's runners are shell executors: they ignore `image:` and run on a host with Python 3.10 and
+# Docker. So the tests run in a python:3.14.8-slim container (the image's Python), and nothing is installed
+# on the runner. `docker cp` instead of a bind mount also works with docker-in-docker on other runners.
+Tests:
+  stage: test
+  rules:
+  - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"
+    when: always
+  - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    when: always
+  - if: $CI_COMMIT_TAG
+    when: always
+  variables:
+    TEST_CONTAINER: s4hc-tests-$CI_JOB_ID
+  script:
+  - >
+    docker create --name "$TEST_CONTAINER" python:3.14.8-slim
+    sh -c "cd /src && pip install -q -r requirements.txt && python -m pytest tests -q -p no:cacheprovider"
+  - docker cp . "$TEST_CONTAINER:/src"
+  - docker start -a "$TEST_CONTAINER"
+  # Runs whatever failed above, so no test container is left on the shared runner host.
+  after_script:
+  - docker rm -f "$TEST_CONTAINER" >/dev/null 2>&1 || true
+
+.image_template:
+  image: docker:20
+  services:
+  - docker:20.10.16-dind
+  before_script:
+  - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+
+Build:
+  extends: .image_template
+  stage: build
+  rules:
+  - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"
+    when: on_success
+  - if: $CI_COMMIT_TAG
+    when: on_success
+  - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    when: manual
+    allow_failure: true
+  script:
+  # :<short sha> on main and tags (the release jobs retag it); :mr-<iid>-<short sha> for a merge request.
+  - IMAGE_REF="$CI_REGISTRY_IMAGE:${CI_MERGE_REQUEST_IID:+mr-$CI_MERGE_REQUEST_IID-}$CI_COMMIT_SHORT_SHA"
+  - docker pull $CI_REGISTRY_IMAGE:latest || true
+  - >
+    docker build --pull --cache-from $CI_REGISTRY_IMAGE:latest
+    --label "com.syntax.genai.image.title=$CI_PROJECT_TITLE"
+    --label "com.syntax.genai.image.url=$CI_PROJECT_URL"
+    --label "com.syntax.genai.image.created=$CI_JOB_STARTED_AT"
+    --label "com.syntax.genai.image.revision=$CI_COMMIT_SHA"
+    --label "com.syntax.genai.image.version=$CI_COMMIT_REF_NAME"
+    --tag "$IMAGE_REF" .
+  - docker push "$IMAGE_REF"
+
+release latest:
+  extends: .image_template
+  variables:
+    GIT_STRATEGY: none
+  stage: release
+  rules:
+  - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"
+    when: on_success
+  script:
+  - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  - docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA $CI_REGISTRY_IMAGE:latest
+  - docker push $CI_REGISTRY_IMAGE:latest
+
+release tag:
+  extends: .image_template
+  variables:
+    GIT_STRATEGY: none
+  stage: release
+  rules:
+  - if: $CI_COMMIT_TAG
+    when: on_success
+  script:
+  - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  - docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_NAME
+  - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_NAME

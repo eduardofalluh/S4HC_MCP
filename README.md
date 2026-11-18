@@ -1,93 +1,145 @@
-# mcp-sap-s4hana-cloud
+# SAP S/4HANA Cloud (Public Edition) MCP — Cost Center Analysis
 
+Read-only MCP server that lets a GenAI Studio / Claude agent pull cost center
+master data and actuals straight from an S/4HANA Cloud Public Edition tenant,
+instead of downloading reports and uploading them to the agent.
 
+Same shape as `CALM_MCP`: FastMCP + `requests`, stdio or Streamable HTTP,
+env-var or per-request-header credentials, `src/s4hc/{config,client,dependencies,tools}`.
 
-## Getting started
+## Tools (16, all read-only)
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+See `docs/GENAI_STUDIO_DEPLOYMENT.md` for the full table. Core: `cost_center_summary`,
+`compare_cost_center_periods`, `actuals_breakdown`, `cost_center_trend`,
+`get_cost_center_actuals`, `get_cost_center_postings`, `get_actual_vs_plan`,
+master data (`list_company_codes`, `list_cost_centers`, `list_profit_centers`,
+`list_gl_accounts`), plus `s4hc_health`, `fiscal_context`, `export_actuals_csv`,
+`describe_service` and the admin-only `s4hc_odata_read`.
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+## Validated against a real tenant
 
-## Add your files
+All 16 tools were run against a Public Edition tenant (2026 release, Syntax "Gamma",
+company codes 1710/2910 and others) on 2026-10-23 with `scripts/live_smoke.py`:
+17 checks passed, 1 skipped (`get_cost_center_postings`: that tenant's communication
+user has no arrangement for `API_GLACCOUNTLINEITEM`, which `s4hc_health(live=true)`
+reports). Totals reconcile across tools (actuals, summary, breakdown and actual-vs-plan
+give the same company code total). Field lists in `config.py` match that tenant's
+`$metadata` exactly.
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+Things the real tenant does that a fake backend would not, now handled and tested:
 
+- `A_JournalEntryItemBasic` holds every Universal Journal line. Balance sheet and revenue
+  lines carry no cost center and net a company code to ~0, so cost center tools keep only
+  lines with a cost center (`cost_center_lines_only=true`, overridable).
+- `FiscalPeriod` comes back without leading zeros (`'1'`, `'10'`); the server pads it so
+  periods sort and compare correctly.
+- The profit center master's `CompanyCode` is blank; the real assignment is n:m in
+  `API_PROFITCENTER_SRV`'s `A_PrftCtrCompanyCodeAssignment`.
+- A user can read a service's `$metadata` yet lack the arrangement to read its data;
+  `s4hc_health(live=true)` therefore reads one row from every service.
+
+`A_JournalEntryItemBasic` is an aggregating entity: amounts are summed over the
+dimensions in `$select`, so grouping happens inside S/4HANA and row counts stay small.
+The same service ships `A_CompanyCode`, `A_CostCenter`, `A_ProfitCenter` and
+`A_GLAccountInChartOfAccounts`, so **one** communication arrangement covers master data and actuals.
+Field names were verified against SAP's generated clients
+(`@sap/cloud-sdk-vdm-cost-center-service` 2.1.0 and
+`@sap/cloud-sdk-vdm-journal-entry-item-basic-service` 2.1.0).
+
+Plan data uses `A_FinPlanningEntryItem` (`API_FINPLANNINGENTRYITEM_SRV`), verified against
+`@sap/cloud-sdk-vdm-financial-planning-entry-item-service` 2.1.0. Posting detail uses
+`API_GLACCOUNTLINEITEM`; its fields are validated against the tenant's `$metadata` at first use.
+
+Client behaviour: retry with backoff on 429/502/503/504 honouring `Retry-After`, `/Date()/` → ISO
+dates, `$top/$skip` + `__next` paging restricted to the configured origin and service path with
+repeated-link detection and a page cap, hard row ceiling, scope-partitioned master-data cache,
+validation on every ID and field name, machine-readable error codes (`[QUERY_TOO_LARGE]`,
+`[MIXED_CURRENCY]`, `[UNAUTHORIZED_SCOPE]`, `[PLAN_UNAVAILABLE]`, …), GET only.
+
+Governance (per SAP ref-arch 137800 / API Policy v.4.2026a): backend data scope allowlists that a
+connection header can only narrow, audit log per tool call, per-connection rate limit, inbound API key
+(required to bind `--http` publicly), browser-Origin guard, server credentials never sent to a
+caller-named host, API hosts restricted to SAP domains, no redirects followed, personal-data fields
+opt-in, refusal of mixed-currency or truncated totals. Compliance mapping and remaining tenant gates:
+`docs/CONNECTION_INPUTS.md`.
+
+Why Python and not TypeScript: it matches CALM_MCP (same FastMCP stack, same GenAI Studio
+deployment pattern), so the team operates one toolchain.
+
+## Authentication
+
+Default: API key (or none on stdio) towards the MCP, communication user (Basic or X.509) towards SAP.
+Optional, all opt-in: OIDC/JWT sign-in for MCP clients, OAuth 2.0 client credentials to S/4HANA, BTP
+Destination service, and per-user principal propagation for public and private cloud (modelled on
+[ARC-1](https://github.com/arc-mcp/arc-1)). See [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md).
+
+## Tenant setup (one-time, per tenant)
+
+1. **Maintain Communication Users** → create a user (password or X.509 certificate).
+2. **Maintain Communication Systems** → create a system, add the user as inbound user.
+3. **Maintain Communication Arrangements** → create arrangements for:
+   - **Required:** `API_JOURNALENTRYITEMBASIC_SRV` (SAP_COM_0087 or SAP_COM_0241 — confirm in tenant)
+   - **Optional:** `API_COSTCENTER_SRV` (cost center names), `API_PROFITCENTER_SRV` (profit center names and
+     company code assignment), `API_GLACCOUNTINCHARTOFACCOUNTS_SRV` (G/L account names),
+     `API_FINPLANNINGENTRYITEM_SRV` (plan, SAP_COM_0087), `API_GLACCOUNTLINEITEM` (postings, SAP_COM_0303)
+4. Note the API host: `https://<tenant>-api.s4hana.cloud.sap` (the `-api` host, not the Fiori host).
+5. Run `s4hc_health(live=true)` → `ok`, or `ok_with_optional_services_missing` if only the required one is set up.
+
+Full list of connection inputs (3 required, 5 optional): `docs/CONNECTION_INPUTS.md`.
+GenAI Studio deployment: `docs/GENAI_STUDIO_DEPLOYMENT.md`.
+
+Read-only API calls do not create documents, so SAP Digital Access document licensing is not triggered.
+Confirm against the client's contract if in doubt.
+
+## Run
+
+```bash
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # fill in S4HC_BASE_URL + credentials
+
+python server.py                      # stdio
+python server.py --http --port 8000   # http://127.0.0.1:8000/mcp
+python -m pytest tests -q             # 225 tests: unit (fake OData backend that mimics a real tenant) + HTTP end-to-end
+python scripts/live_smoke.py          # all 16 tools against the tenant in S4HC_* (read-only)
 ```
-cd existing_repo
-git remote add origin https://gitlab.com/syntax-cloud/CloudAdmin/genai/third-parties/mcp-servers/mcp-sap-s4hana-cloud.git
-git branch -M main
-git push -uf origin main
+
+Claude Desktop (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "sap-s4hana-cloud": {
+      "command": "/path/to/S4HC_MCP/venv/bin/python",
+      "args": ["/path/to/S4HC_MCP/server.py"],
+      "env": { "S4HC_BASE_URL": "https://<tenant>-api.s4hana.cloud.sap", "S4HC_USER": "...", "S4HC_PASSWORD": "..." }
+    }
+  }
+}
 ```
 
-## Integrate with your tools
+## GenAI Studio deployment
 
-* [Set up project integrations](https://gitlab.com/syntax-cloud/CloudAdmin/genai/third-parties/mcp-servers/mcp-sap-s4hana-cloud/-/settings/integrations)
+Same as CALM MCP: run `python server.py --http --host 0.0.0.0 --port 8000`, set
+`S4HC_*` as deployment secrets (single-quote values containing `$`), keep
+`MCP_TRUST_PROXY=true` behind the ingress. With the S/4HANA sign-in (`S4HC_SAP_AUTH=user_token`), also set
+`S4HC_TRUSTED_PROXY_HOPS` (see [AUTHENTICATION.md](docs/AUTHENTICATION.md)). For several client tenants on one
+deployment, leave the env vars empty and inject `x-s4hc-base-url`,
+`x-s4hc-user`, `x-s4hc-password` per connection.
 
-## Collaborate with your team
+## Example prompts once connected
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+- "List the active cost centers in company code 1710." (responsible persons only with `S4HC_EXPOSE_PERSON_FIELDS=true`)
+- "Give me a cost center summary for FY2026 periods 1–9 vs FY2025, ledger 0L."
+- "What does cost center 4120 spend on? Break it down by G/L account." → `actuals_breakdown`
+- "Which cost centers book travel (65000000)?" → `actuals_breakdown(dimension='CostCenter', gl_accounts=[...])`
+- "Show the trailing 12 months for 4120 and flag anything unusual." → `cost_center_trend`
+- "Export 2026 actuals for the IT cost centers as CSV." → `export_actuals_csv`
 
-## Test and Deploy
+## Extending
 
-Use the built-in continuous integration in GitLab.
-
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+- **Plan in SAC only:** `get_actual_vs_plan` reads plans stored in S/4HANA. If budgets live
+  only in SAC, expose them via that system's read API or a Custom CDS view instead.
+- **Governed access:** the same tools can be fronted by the SAP Integration Suite
+  MCP Gateway when a client requires SAP-managed exposure.
+- Writes are intentionally absent; the client only issues GET.

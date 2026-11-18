@@ -1,0 +1,223 @@
+"""
+SAP S/4HANA Cloud (Public Edition) MCP Server — cost center analysis.
+
+Run
+---
+    python server.py                       # stdio (Claude Desktop, Cursor, Inspector)
+    python server.py --http --port 8000    # Streamable HTTP for Syntax GenAI Studio
+
+Auth
+----
+Read-only. Uses an S/4HANA Cloud *communication user* on the API host
+(https://<tenant>-api.s4hana.cloud.sap) with either Basic auth or an X.509
+client certificate. Credentials come from env vars (see .env.example) or
+per-request headers x-s4hc-base-url / x-s4hc-user / x-s4hc-password for
+multi-tenant hosted deployments. Nothing is hard-coded.
+
+Required communication arrangements on the tenant
+--------------------------------------------------
+    API_JOURNALENTRYITEMBASIC_SRV   → Journal Entry Item read scenario (REQUIRED:
+                                      actuals + company codes, cost/profit centers, G/L accounts)
+    API_COSTCENTER_SRV              → SAP_COM_0087 (OPTIONAL: cost center names/descriptions)
+    API_GLACCOUNTLINEITEM           → G/L Account Line Items read scenario (OPTIONAL: posting-level detail)
+    API_FINPLANNINGENTRYITEM_SRV    → Financial Planning Entry Item read (OPTIONAL: actual vs plan)
+
+Governance (SAP third-party MCP reference architecture 137800, API Policy v.4.2026a)
+-----------------------------------------------------------------------------------
+  * read-only (GET only), input validation on every ID / field
+  * backend data scope: S4HC_ALLOWED_COMPANY_CODES / S4HC_ALLOWED_COST_CENTERS
+    (or x-s4hc-allowed-company-codes / x-s4hc-allowed-cost-centers per connection)
+  * audit log per tool call, MCP rate limit S4HC_RATE_LIMIT_PER_MIN (default 120)
+  * paging + hard row ceiling, retry/backoff that honours Retry-After
+Run s4hc_health(live=true) to confirm what responds.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import logging
+import os
+import sys
+
+from dotenv import load_dotenv
+
+# Before any src.s4hc import: config reads service paths and cache sizes at import time.
+load_dotenv()
+
+from fastmcp import FastMCP  # noqa: E402
+from starlette.middleware import Middleware  # noqa: E402
+from starlette.types import ASGIApp, Receive, Scope, Send  # noqa: E402
+
+from src.s4hc.governance import AuditAndRateLimitMiddleware  # noqa: E402
+from src.s4hc.tools import actuals, analysis, cost_centers, health, master_data, odata_read, plan, postings  # noqa: E402
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stderr,
+)
+log = logging.getLogger("s4hc-mcp")
+
+
+class _TrustProxyMiddleware:
+    """Rewrite Host to 'localhost' for k8s/ingress deployments (same as CALM MCP)."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            headers = [(k, v) for k, v in scope.get("headers", []) if k.lower() != b"host"]
+            headers.append((b"host", b"localhost"))
+            scope = {**scope, "headers": headers}
+        await self.app(scope, receive, send)
+
+
+class _InboundKeyMiddleware:
+    """Optional caller authentication for the HTTP endpoint (trust boundary
+    AI client → MCP). When S4HC_MCP_API_KEY is set, every request must carry
+    'Authorization: Bearer <key>' or 'x-api-key: <key>'. Constant-time compare.
+    For full OAuth (issuer/audience validation) put the server behind the
+    platform's OAuth proxy or the Integration Suite MCP Gateway."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        import hmac
+
+        self.app = app
+        self.key = os.getenv("S4HC_MCP_API_KEY", "").encode()
+        self._eq = hmac.compare_digest
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and self.key:
+            h = {k.lower(): v for k, v in scope.get("headers", [])}
+            auth = h.get(b"authorization", b"")
+            supplied = auth[7:] if auth[:7].lower() == b"bearer " else h.get(b"x-api-key", b"")
+            if not supplied or not self._eq(supplied, self.key):
+                body = b'{"error":"unauthorized"}'
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"application/json"), (b"www-authenticate", b"Bearer")]})
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self.app(scope, receive, send)
+
+
+class _OriginGuardMiddleware:
+    """Refuse browser-originated requests (DNS rebinding, drive-by pages): a
+    browser always sends Origin on a cross-site POST, MCP clients do not. Allow
+    specific origins with S4HC_ALLOWED_ORIGINS (comma list) if a web client
+    legitimately calls /mcp."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+        self.allowed = {o.strip().rstrip("/").lower().encode()
+                        for o in os.getenv("S4HC_ALLOWED_ORIGINS", "").split(",") if o.strip()}
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            origin = next((v for k, v in scope.get("headers", []) if k.lower() == b"origin"), None)
+            if origin and origin.rstrip(b"/").lower() not in self.allowed:
+                await send({"type": "http.response.start", "status": 403,
+                            "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body", "body": b'{"error":"origin not allowed"}'})
+                return
+        await self.app(scope, receive, send)
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+from src.s4hc.inbound_auth import build_auth_provider  # noqa: E402
+
+# OIDC resource server or S/4HANA OAuth sign-in when configured; None keeps the API-key / open modes.
+AUTH_PROVIDER = build_auth_provider()
+mcp = FastMCP("sap-s4hana-cloud", auth=AUTH_PROVIDER)
+
+# Audit log of every tool call + MCP-level rate limit (SAP ref-arch 137800 / API Policy §2.1)
+mcp.add_middleware(AuditAndRateLimitMiddleware())
+
+health.register(mcp)         # s4hc_health, fiscal context lives in analysis
+master_data.register(mcp)    # list_company_codes, list_profit_centers, list_gl_accounts
+cost_centers.register(mcp)   # list_cost_centers (with fallback)
+actuals.register(mcp)        # get_cost_center_actuals, cost_center_summary
+analysis.register(mcp)       # fiscal_context, actuals_breakdown, compare_cost_center_periods, cost_center_trend, export_actuals_csv
+postings.register(mcp)       # get_cost_center_postings (API_GLACCOUNTLINEITEM, optional)
+plan.register(mcp)           # get_actual_vs_plan (API_FINPLANNINGENTRYITEM_SRV, optional)
+odata_read.register(mcp)     # describe_service, s4hc_odata_read
+
+
+def connection_info_mode() -> str:
+    from src.s4hc.dependencies import connection_info
+
+    info = connection_info(None)
+    if info["mixed_auth"]:
+        return (f"MCP={info['mcp_auth']} SAP={info['signed_in_users']} for signed-in users, "
+                f"{info['auth_mode']} for API-key calls (mixed)")
+    return f"MCP={info['mcp_auth']} SAP={info['signed_in_users'] or info['auth_mode']}"
+
+
+def _startup_check() -> None:
+    from src.s4hc.dependencies import connection_info
+
+    info = connection_info(None)
+    mode = (os.getenv("S4HC_SAP_AUTH") or "").strip().lower()
+    if os.getenv("S4HC_MIXED_AUTH") and not info["signed_in_users"]:
+        log.warning("S4HC_MIXED_AUTH has no effect: S4HC_SAP_AUTH is not principal_propagation or user_token")
+    if info["mixed_auth"] and info["signed_in_users_error"]:
+        log.warning("Mixed sign-in: signed-in users cannot be served: %s", info["signed_in_users_error"])
+    elif info["mixed_auth"]:
+        log.info("Mixed sign-in: signed-in users reach SAP as themselves (%s); API-key calls use %s at %s "
+                 "with that account's SAP rights", info["signed_in_users"], info["auth_mode"], info["base_url"])
+    if info["mixed_auth"]:
+        if info["auth_mode"] == "none":
+            log.warning("Mixed sign-in: no S4HC_USER/S4HC_PASSWORD or certificate, so API-key calls need "
+                        "x-s4hc-* headers")
+    elif info["auth_mode"] == "none" and mode not in ("", "basic"):
+        log.warning("S4HC_SAP_AUTH=%s is not usable: %s", mode, info["base_url"])
+    elif info["auth_mode"] == "none":
+        log.warning("No S4HC_USER/S4HC_PASSWORD or client certificate set — expecting per-request x-s4hc-* headers.")
+    else:
+        log.info("S/4HANA Cloud target %s (auth=%s, ledger=%s)", info["base_url"], info["auth_mode"], info["default_ledger"])
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="SAP S/4HANA Cloud MCP server")
+    parser.add_argument("--http", action="store_true", help="Serve over Streamable HTTP instead of stdio.")
+    parser.add_argument("--host", default=os.getenv("MCP_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("MCP_PORT", "8000")))
+    args = parser.parse_args()
+
+    _startup_check()
+
+    if args.http:
+        no_auth_ok = os.getenv("S4HC_MCP_ALLOW_UNAUTHENTICATED", "false").lower() in ("1", "true", "yes")
+        if not (os.getenv("S4HC_MCP_API_KEY") or AUTH_PROVIDER) and not _is_loopback(args.host) and not no_auth_ok:
+            log.error("Refusing to serve /mcp on %s without S4HC_MCP_API_KEY. Set the key, or set "
+                      "S4HC_MCP_ALLOW_UNAUTHENTICATED=true if the platform authenticates callers.", args.host)
+            sys.exit(2)
+        middleware = [Middleware(_OriginGuardMiddleware)]
+        if AUTH_PROVIDER is None:  # with a provider, the API key is one of the accepted bearer tokens
+            middleware.append(Middleware(_InboundKeyMiddleware))
+        if os.getenv("MCP_TRUST_PROXY", "true").lower() in ("1", "true", "yes"):
+            middleware.append(Middleware(_TrustProxyMiddleware))
+        if AUTH_PROVIDER is not None:
+            log.info("OAuth required on /mcp (%s)", connection_info_mode())
+        elif os.getenv("S4HC_MCP_API_KEY"):
+            log.info("Inbound API key required on /mcp")
+        else:
+            log.warning("S4HC_MCP_API_KEY not set — /mcp accepts any caller; rely on network/platform auth")
+        log.info("Starting S/4HANA Cloud MCP on http://%s:%s/mcp", args.host, args.port)
+        mcp.run(transport="streamable-http", host=args.host, port=args.port, middleware=middleware)
+    else:
+        log.info("Starting S/4HANA Cloud MCP on stdio")
+        mcp.run()
+
+
+if __name__ == "__main__":
+    main()
